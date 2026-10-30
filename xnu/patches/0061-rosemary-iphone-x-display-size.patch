@@ -1,0 +1,124 @@
+--- a/iokit/Kernel/arm/RosemaryFramebuffer.cpp
++++ b/iokit/Kernel/arm/RosemaryFramebuffer.cpp
+@@ -61,7 +61,17 @@
+ #define ROSEMARY_FB_NOTIFY_TYPES           8
+ #define ROSEMARY_FB_NOTIFY_VSYNC           5
+ #define ROSEMARY_FB_VSYNC_US               16667
+-#define ROSEMARY_FB_DOT_PITCH              395     /* ppi, 6.67" 1080x2400 */
++#define ROSEMARY_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++/*
++ * The iOS userland only has status bar / layout data for real iPhone
++ * screens (UIKit: "No status bar visual provider for screen", the red
++ * rdar://45025538 bar for 360x800 points). The display is therefore
++ * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
++ * centered 1080x2400 part of it is shown on the 1080x2400 panel.
++ * Boot-arg rosemaryfb_native=1 presents the real panel size instead.
++ */
++#define ROSEMARY_FB_LOGICAL_W              1125
++#define ROSEMARY_FB_LOGICAL_H              2436
+ #define ROSEMARY_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -84,6 +94,8 @@
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
++	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
++	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	RosemarySurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -144,6 +156,16 @@
+ 		IOLog("ROSEMARY FB: no boot framebuffer\n");
+ 		return false;
+ 	}
++	int native = 0;
++	PE_parse_boot_argn("rosemaryfb_native", &native, sizeof(native));
++	fLogicalW = fWidth;
++	fLogicalH = fHeight;
++	if (!native && fWidth <= ROSEMARY_FB_LOGICAL_W && fHeight <= ROSEMARY_FB_LOGICAL_H) {
++		fLogicalW = ROSEMARY_FB_LOGICAL_W;
++		fLogicalH = ROSEMARY_FB_LOGICAL_H;
++	}
++	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
++	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = rosemary_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, ROSEMARY_FB_FORMAT_BGRA);
+@@ -169,8 +191,8 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("ROSEMARY FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
++	IOLog("ROSEMARY FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+ }
+ 
+@@ -309,6 +331,19 @@
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		/* Logical (presented) display coordinates -> panel coordinates. */
++		dx -= fOffX;
++		dy -= fOffY;
++		if (dx < 0) {
++			sx -= dx;
++			w += dx;
++			dx = 0;
++		}
++		if (dy < 0) {
++			sy -= dy;
++			h += dy;
++			dy = 0;
++		}
+ 		if (w > (int32_t)s->width - sx) {
+ 			w = (int32_t)s->width - sx;
+ 		}
+@@ -444,8 +479,8 @@
+ 		outCount = 1;
+ 		break;
+ 	case kRosemaryFBGetDisplaySize:
+-		out[0] = fFB->fWidth;
+-		out[1] = fFB->fHeight;
++		out[0] = fFB->fLogicalW;
++		out[1] = fFB->fLogicalH;
+ 		outCount = 2;
+ 		break;
+ 	case kRosemaryFBIsMainDisplay:
+--- a/iokit/Kernel/arm/hid/RosemaryHID.cpp
++++ b/iokit/Kernel/arm/hid/RosemaryHID.cpp
+@@ -359,6 +359,7 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
+ 	IOLock *fLock;
++	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[ROSEMARY_TOUCH_FINGERS];
+ 	IOFixed fX[ROSEMARY_TOUCH_FINGERS];
+ 	IOFixed fY[ROSEMARY_TOUCH_FINGERS];
+@@ -422,6 +423,12 @@
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
++	int native = 0;
++	PE_parse_boot_argn("rosemaryfb_native", &native, sizeof(native));
++	fLogicalW = native ? 1080 : 1125;
++	fLogicalH = native ? 2400 : 2436;
++	fOffX = (fLogicalW - 1080) / 2;
++	fOffY = (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -447,8 +454,9 @@
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	IOFixed nx = (IOFixed)(((int64_t)x << 16) / 1080);
+-	IOFixed ny = (IOFixed)(((int64_t)y << 16) / 2400);
++	/* Panel pixels -> the presented 1125x2436 display (RosemaryFramebuffer.cpp). */
++	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
