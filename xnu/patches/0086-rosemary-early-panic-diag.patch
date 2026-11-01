@@ -1,20 +1,21 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: rosemary port <port@local>
-Date: Sun, 1 Nov 2026 17:05:00 +0500
-Subject: [PATCH] osfmk/arm64: print esr/far/spsr/tpidr and stack return
- addresses from the early panic hook
+Date: Sun, 1 Nov 2026 18:10:00 +0500
+Subject: [PATCH] osfmk/arm64: noinline early-panic diagnostic (regs + stack)
 
-The normal panic path needs per-CPU/thread state that does not exist yet at
-this point, so the only way to see what happened is to dump the raw fault
-registers and the stack words that look like kernel text addresses.
+The panic hook itself is merged into a cold path by the optimiser when the
+diagnostic lives inline, so it never runs. Move it into a separate noinline
+function and call it as the first statement of the hook: print ESR/FAR/ELR/
+SPSR/TPIDR plus the stack words that look like kernel text addresses, then
+spin in wfe so the frame can be photographed.
 
 ---
- osfmk/arm64/rosemary_early.c | 47 ++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 47 insertions(+)
+ osfmk/arm64/rosemary_early.c | 69 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
 
 --- a/osfmk/arm64/rosemary_early.c
 +++ b/osfmk/arm64/rosemary_early.c
-@@ -109,6 +109,15 @@
+@@ -109,6 +109,56 @@
  	rosemary_early_putc('\n');
  }
  
@@ -27,51 +28,56 @@ registers and the stack words that look like kernel text addresses.
 +	}
 +}
 +
- void
- rosemary_early_panic(const char *fmt, va_list *args)
- {
-@@ -122,6 +131,44 @@
- 	_doprnt(fmt, &copy, rosemary_early_putc, 16);
- 	va_end(copy);
- 	rosemary_early_putc('\n');
++__attribute__((noinline, used)) static void
++rosemary_early_diag(void)
++{
++	uint64_t esr, far, elr, spsr, tpidr;
++	uintptr_t sp;
++	volatile uint64_t *stk;
 +
-+	/* ROSEMARY DIAG: the normal panic path needs per-CPU/thread state that
-+	 * may not exist yet, so print raw evidence here: fault registers plus the
-+	 * stack words that look like kernel code addresses (return addresses). */
-+	{
-+		uint64_t esr, far, elr, spsr, tpidr;
-+		uintptr_t sp;
++	__asm__ volatile("mrs %0, esr_el1" : "=r"(esr));
++	__asm__ volatile("mrs %0, far_el1" : "=r"(far));
++	__asm__ volatile("mrs %0, elr_el1" : "=r"(elr));
++	__asm__ volatile("mrs %0, spsr_el1" : "=r"(spsr));
++	__asm__ volatile("mrs %0, tpidr_el1" : "=r"(tpidr));
++	__asm__ volatile("mov %0, sp" : "=r"(sp));
++	stk = (volatile uint64_t *)sp;
 +
-+		__asm__ volatile("mrs %0, esr_el1" : "=r"(esr));
-+		__asm__ volatile("mrs %0, far_el1" : "=r"(far));
-+		__asm__ volatile("mrs %0, elr_el1" : "=r"(elr));
-+		__asm__ volatile("mrs %0, spsr_el1" : "=r"(spsr));
-+		__asm__ volatile("mrs %0, tpidr_el1" : "=r"(tpidr));
-+		__asm__ volatile("mov %0, sp" : "=r"(sp));
-+
-+		rosemary_early_string("  esr=");
-+		rosemary_early_hex64(esr);
-+		rosemary_early_string(" far=");
-+		rosemary_early_hex64(far);
-+		rosemary_early_string("\n  elr=");
-+		rosemary_early_hex64(elr);
-+		rosemary_early_string(" spsr=");
-+		rosemary_early_hex64(spsr);
-+		rosemary_early_string(" tpidr=");
-+		rosemary_early_hex64(tpidr);
-+		rosemary_early_string("\n  stack:");
-+		for (unsigned int i = 0; i < 768; i++) {
-+			uint64_t v = ((volatile uint64_t *)sp)[i];
-+			if (v >= 0xfffffe0007004000ULL && v < 0xfffffe0008108000ULL) {
-+				rosemary_early_putc(' ');
-+				rosemary_early_hex64(v);
-+			}
++	rosemary_early_string("ROSEMARY DIAG\n  esr=");
++	rosemary_early_hex64(esr);
++	rosemary_early_string(" far=");
++	rosemary_early_hex64(far);
++	rosemary_early_string("\n  elr=");
++	rosemary_early_hex64(elr);
++	rosemary_early_string(" spsr=");
++	rosemary_early_hex64(spsr);
++	rosemary_early_string(" tpidr=");
++	rosemary_early_hex64(tpidr);
++	rosemary_early_string("\n  stack:");
++	for (unsigned int i = 0; i < 768; i++) {
++		uint64_t v = stk[i];
++		if (v >= 0xfffffe0007004000ULL && v < 0xfffffe0008108000ULL) {
++			rosemary_early_putc(' ');
++			rosemary_early_hex64(v);
 +		}
-+		rosemary_early_putc('\n');
 +	}
++	rosemary_early_string("\n");
++
++	__asm__ volatile("dsb sy" ::: "memory");
 +	for (;;) {
 +		__asm__ volatile("wfe");
 +	}
- 	__asm__ volatile("dsb sy" ::: "memory");
- }
- 
++}
++
+ void
+ rosemary_early_panic(const char *fmt, va_list *args)
+ {
+@@ -116,6 +166,8 @@
+ 		return;
+ 	}
+ 	early_panicking = 1;
++	rosemary_early_diag();
++	/* not reached */
+ 	rosemary_early_string("\nROSEMARY EARLY PANIC: ");
+ 	va_list copy;
+ 	va_copy(copy, *args);
