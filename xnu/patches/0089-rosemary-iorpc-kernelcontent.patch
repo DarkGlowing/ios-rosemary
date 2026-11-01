@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rosemary port <port@local>
+Date: Sun, 1 Nov 2026 19:26:00 +0500
+Subject: [PATCH] iokit: add IORPC.kernelContent so Xcode 16 iig builds
+
+The macOS 14 runner image is retired on 2026-11-02, so the build has to move
+to macos-15 and its Xcode 16 toolchain. Xcode 16's iig emits kernel-side
+DriverKit RPC code that assigns rpc.kernelContent, which xnu-8796's IORPC
+struct does not have. Upstream xnu-11215 (macOS 15) carries exactly this
+member, so backport the field (kernel builds only, like upstream).
+---
+diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -224,6 +224,11 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/* Xcode 16's iig (macOS 15 SDK) assigns rpc.kernelContent on the kernel
++	 * side of DriverKit RPC; macOS 15 xnu gained the same member (11215). */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
+
