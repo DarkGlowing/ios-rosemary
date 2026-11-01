@@ -1,0 +1,19 @@
+From: rosemary port
+Subject: [PATCH 0063] rosemary touch: Goodix GENI packing replaced by MTK I2C PIO
+
+On rosemary (MT6785) the touch transport is MediaTek i2c-mt65xx PIO, not
+Qualcomm GENI QUP. The full Goodix GT9896 protocol (status 0x4180, report
+0x4188, ack write 0) is implemented directly in rosemary_touch.c from patch
+0060, so the GENI FIFO-packing changes this patch previously carried are
+obsolete. Kept as a trivial no-op to preserve patch numbering 0001-0081.
+
+diff --git a/xnu/README.md b/xnu/README.md
+index 1111111..2222222 100644
+--- a/xnu/README.md
++++ b/xnu/README.md
+@@ -1,3 +1,5 @@
+ # XNU for rosemary
+ 
++0063 no-op: Goodix GENI packing replaced by MTK I2C PIO transport in 0060.
++
+ Built on GitHub's macOS arm64 runners by `.github/workflows/xnu.yml`, using

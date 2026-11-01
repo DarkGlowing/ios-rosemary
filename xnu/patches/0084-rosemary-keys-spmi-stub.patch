@@ -1,0 +1,27 @@
+--- a/bsd/dev/rosemary_keys.c	2026-10-29 23:04:45.797720426 +0600
++++ b/bsd/dev/rosemary_keys.c	2026-10-29 23:04:45.836721494 +0600
+@@ -21,7 +21,14 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+-#include "rosemary_spmi.h"
++/*
++ * Stub build fix: real pwrap/PMIC access lives in rosemary_spmi.c /
++ * rosemary_spmi.h (added by patch 0062). Until 0062 applies cleanly,
++ * build standalone: pwrap reads return all-ones (keys released),
++ * keys never fire, battery is static. Boot is unaffected.
++ */
++static inline int      rosemary_spmi_init(void)          { return 0; }
++static inline uint16_t rosemary_pwrap_read16(unsigned a) { (void)a; return 0xffffu; }
+ 
+ extern void rosemary_hid_key(int key, int down);
+ 
+@@ -68,7 +75,7 @@
+ }
+ 
+ /* Battery: called periodically by the power-source nub. Returns mV. */
+-unsigned rosemary_battery_mv(void);	/* in rosemary_spmi.c (AUXADC) */
++unsigned rosemary_battery_mv(void) { return 4200; /* mV stub; real in rosemary_spmi.c */ }
+ 
+ void rosemary_keys_init(void);
+ 

@@ -1,0 +1,41 @@
+--- a/shim/platform_mt6785.h	2026-10-30 02:26:50.576043037 +0600
++++ b/shim/platform_mt6785.h	2026-10-30 02:26:50.660043423 +0600
+@@ -30,3 +30,4 @@
+ void wdt_pet(void);
+ void wdt_init_long_timeout(void);
+ void emi_restore(void);
++void wdt_disable(void);		/* stop the MTK A7 hardware watchdog entirely */
+--- a/shim/platform_mt6785.c	2026-10-30 02:26:50.585043078 +0600
++++ b/shim/platform_mt6785.c	2026-10-30 02:26:50.660043423 +0600
+@@ -35,6 +35,15 @@
+ 	wdt_pet();
+ }
+ 
++void wdt_disable(void)
++{
++	/* WDT_MODE bit0 = WDT_EN (1 = running). Clear it with the same key
++	 * that protects WDT_LENGTH/WDT_RESTART. Best-effort: if the preloader
++	 * uses a different WDT instance this write is harmless. */
++	wr32(A7_WDT_BASE + WDT_MODE, (WDT_KEY << 16) | 0x0000u);
++	dsb();
++}
++
+ void emi_restore(void)
+ {
+ 	/* 1. Power up / exit self-refresh on both DRAM channels.
+--- a/shim/shim.c	2026-10-30 02:26:50.595043124 +0600
++++ b/shim/shim.c	2026-10-30 02:26:50.661043427 +0600
+@@ -383,6 +383,13 @@
+ {
+ 	struct mmu_info mi;
+ 
++	/* EARLY BRING-UP: stop the hardware WDT (hang no longer reboots) and
++	 * paint the screen GREEN as the very first visible action.
++	 *   green -> shim_main reached, framebuffer works
++	 *   black -> died in start.S / before shim_main (or backlight off) */
++	wdt_disable();
++	con_clear(GREEN);
++
+ 	/* MT6785 rosemary: extend A7 WDT timeout and pet it immediately so a
+ 	 * slow probe does not get reset before the console is readable. */
+ 	wdt_init_long_timeout();

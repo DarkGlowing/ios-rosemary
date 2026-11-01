@@ -1,0 +1,99 @@
+--- a/bsd/dev/rosemary_keys.c	2026-10-29 21:46:00.551889000 +0600
++++ b/bsd/dev/rosemary_keys.c	2026-10-29 21:45:36.033571000 +0600
+@@ -8,13 +8,12 @@
+  * Power key : MT6359 TOPSTATUS (0x0a08) bit 3 (KPWR, active low = pressed).
+  * Volume +/-: MT6359 KPD (keypad matrix). On rosemary they are on KPD rows;
+  *             read KPC_GP status (0x090a). If volume does not fire, check
+- *             /proc/device-tree/mt6359/kpd or gpio-keys and adjust KPD_REG.
++ *             the device-tree node mt6359/kpd or gpio-keys and adjust KPD_REG.
+  * Battery   : IOPMPowerSource; voltage from MT6359 AUXADC channel 15 (VBAT)
+  *             when rosemarybattery=1, otherwise static 100 % (boots fine).
+  *
+  * HID consumer-page usages (iOS): Power=0x30, VolUp=0xE9, VolDown=0xEA.
+  */
+-#include <stdint.h>
+ #include <kern/thread.h>
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -25,7 +24,6 @@
+ #include "rosemary_spmi.h"
+ 
+ extern void rosemary_hid_key(int key, int down);
+-extern kern_return_t thread_terminate(thread_t);
+ 
+ /* MT6359 registers (slave 0, via pwrap) */
+ #define MT6359_TOPSTATUS	0x0a08	/* KPWR bit = bit3 (0 = pressed) */
+@@ -33,7 +31,6 @@
+ #define  KPWR_BIT		(1u << 3)
+ #define  KPD_VOLUP_BIT		(1u << 0)	/* adjust after probing KPD matrix */
+ #define  KPD_VOLDN_BIT		(1u << 1)
+-
+ #define KEY_POWER	0x30
+ #define KEY_VOLUP	0xe9
+ #define KEY_VOLDN	0xea
+@@ -45,21 +42,27 @@
+ 
+ static void keys_thread(void *arg, wait_result_t result)
+ {
++	int last[3];		/* power, volup, voldown */
++	uint16_t top, kpd;
++	int power, volup, voldn, k;
++	int state[3], keycode[3];
++
+ 	(void)arg; (void)result;
+-	int last[3] = {0, 0, 0};	/* power, volup, voldown */
++	last[0] = last[1] = last[2] = 0;
+ 	for (;;) {
+-		uint16_t top = pmic_rd(MT6359_TOPSTATUS);
+-		uint16_t kpd = pmic_rd(MT6359_KPD_GP);
+-		int power = !(top & KPWR_BIT);		/* active low */
+-		int volup = !!(kpd & KPD_VOLUP_BIT);
+-		int voldn = !!(kpd & KPD_VOLDN_BIT);
+-		int state[3] = { power, volup, voldn };
+-		int keycode[3] = { KEY_POWER, KEY_VOLUP, KEY_VOLDN };
+-		for (int k = 0; k < 3; k++)
++		top = pmic_rd(MT6359_TOPSTATUS);
++		kpd = pmic_rd(MT6359_KPD_GP);
++		power = !(top & KPWR_BIT);		/* active low */
++		volup = !!(kpd & KPD_VOLUP_BIT);
++		voldn = !!(kpd & KPD_VOLDN_BIT);
++		state[0] = power; state[1] = volup; state[2] = voldn;
++		keycode[0] = KEY_POWER; keycode[1] = KEY_VOLUP; keycode[2] = KEY_VOLDN;
++		for (k = 0; k < 3; k++) {
+ 			if (state[k] != last[k]) {
+ 				rosemary_hid_key(keycode[k], state[k]);
+ 				last[k] = state[k];
+ 			}
++		}
+ 		delay(16);	/* ~60 Hz poll */
+ 	}
+ }
+@@ -67,8 +70,14 @@
+ /* Battery: called periodically by the power-source nub. Returns mV. */
+ unsigned rosemary_battery_mv(void);	/* in rosemary_spmi.c (AUXADC) */
+ 
++void rosemary_keys_init(void);
++
+ void rosemary_keys_init(void)
+ {
++	uint16_t top;
++	thread_t thread;
++	kern_return_t kr;
++
+ 	(void)PE_parse_boot_argn("rosemarykeys", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("rosemarybattery", &real_battery, sizeof(real_battery));
+ 	if (!enabled) {
+@@ -79,11 +88,10 @@
+ 		printf("ROSEMARY KEYS: pwrap init failed, keys disabled\n");
+ 		return;
+ 	}
+-	uint16_t top = pmic_rd(MT6359_TOPSTATUS);
++	top = pmic_rd(MT6359_TOPSTATUS);
+ 	printf("ROSEMARY KEYS: MT6359 pwrap OK, TOPSTATUS=%#x (KPWR %s)\n",
+ 	       top, (top & KPWR_BIT) ? "released" : "pressed");
+-	thread_t thread;
+-	kern_return_t kr = kernel_thread_start((thread_continue_t)keys_thread, NULL, &thread);
++	kr = kernel_thread_start((thread_continue_t)keys_thread, NULL, &thread);
+ 	if (kr != KERN_SUCCESS) {
+ 		printf("ROSEMARY KEYS: kernel_thread_start failed %d\n", kr);
+ 		return;

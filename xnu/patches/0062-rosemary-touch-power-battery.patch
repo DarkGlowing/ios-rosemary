@@ -1,0 +1,625 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,8 @@
+ bsd/dev/rosemary_sample.c			standard
+ bsd/dev/rosemary_keys.c			standard
+ bsd/dev/rosemary_touch.c			standard
++bsd/dev/rosemary_rpmh.c			standard
++bsd/dev/rosemary_spmi.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/rosemary_touch.c
++++ b/bsd/dev/rosemary_touch.c
+@@ -1,8 +1,8 @@
+ /*
+  * ROSEMARY SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
+  * Call once after the scheduler is running; all work runs on one thread.
+- * Requires ABL-loaded GENI I2C firmware and an already powered L11C rail.
+- * No firmware/config upload, RPMh votes or PMIC writes. Only IC data write:
++ * Requires ABL-loaded GENI I2C firmware; votes L11C through rosemary_rpmh.c.
++ * No firmware/config upload or direct PMIC writes. Only IC data write:
+  * zero to GT9896's event status after reading a report. See hw-report.md.
+  */
+ #if defined(ARM64_BOARD_CONFIG_ROSEMARY)
+@@ -18,6 +18,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
++extern int rosemary_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void rosemary_hid_touch(int finger, int down, int x, int y);
+ void rosemary_touch_init(void);
+ 
+@@ -105,14 +106,14 @@
+ }
+ 
+ static void
+-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out)
++touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+ {
+ 	uint32_t off = TOUCH_GPIO_CFG(pin);
+ 	uint32_t cfg = touch_rd(st.gpio, off);
+ 	if (out) {
+-		/* Set the output latch before enabling output, avoiding a reset pulse. */
++		/* Set the desired latch before enabling output (reset is active low). */
+ 		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) | 2u);
++		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+ 	}
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+@@ -490,16 +491,26 @@
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
+-	printf("ROSEMARY TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; L11C must be powered by firmware\n",
++	printf("ROSEMARY TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+-	touch_gpio(6, 1, 0, 0, false); /* qup11 SDA/SCL, 2 mA, no internal pull */
+-	touch_gpio(7, 1, 0, 0, false);
+-	touch_gpio(9, 0, 3, 3, false); /* interrupt input, 8 mA, pull-up */
+-	touch_gpio(90, 0, 0, 0, true); /* board digital power enable, high */
+-	touch_wait(10);
+-	touch_gpio(8, 0, 3, 3, true);  /* release reset; no reset-low pulse */
+-	touch_wait(300);
++	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
++	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
++	touch_gpio(8, 0, 3, 3, true, false);
++	int power_error = rosemary_rpmh_vreg_enable("ldoc11", 3200);
++	if (power_error) {
++		printf("ROSEMARY TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
++		goto out;
++	}
++	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
++	touch_wait(10); /* conservative rail settling; not a DT timing value */
++	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
++	touch_gpio(7, 1, 0, 0, false, false);
++	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
++	touch_gpio(8, 0, 3, 3, true, false);
++	touch_wait(2);
++	touch_gpio(8, 0, 3, 3, true, true);
++	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
+ 	uint8_t gid[12] = {0}, fid1 = 0, fid2 = 0;
+ 	int ge = touch_read(0x5d, 0x4022, true, gid, sizeof(gid));
+ 	printf("ROSEMARY TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@
+ iokit/Kernel/arm/RosemaryWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/RosemarySurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/RosemaryFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/RosemaryBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/RosemaryHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -77,6 +77,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = RosemaryHIDTouch;"
+     "   },"
++    "   {"
++    "     'IOClass'         = RosemaryBattery;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = RosemaryBattery;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+--- /dev/null
++++ b/bsd/dev/rosemary_rpmh.c
+@@ -0,0 +1,27 @@
++/*
++ * rosemary (Redmi Note 10S / MT6785) regulator/touch-rail enable.
++ *
++ * Replaces the sweet Qualcomm RPMh driver. On rosemary there is no RPMh:
++ * regulators are MT6359 LDOs programmed through pwrap. The touchscreen's
++ * vtouch-supply is already enabled by lk (the touch works in Android/fastboot),
++ * so for bring-up this is a no-op success. If you need to gate the rail:
++ *   - read /proc/device-tree/touch/vtouch-supply phandle -> which LDO
++ *   - MT6359 LDOx_CON0 (enable) / LDOx_CON1 (voltage) at the offset in the
++ *     MT6359 datasheet, written with rosemary_pwrap_write16() from rosemary_spmi.c
++ *
++ * `res` and `mv` are accepted for API compatibility; `res` is logged.
++ */
++#include <stdint.h>
++#include <sys/systm.h>
++
++int rosemary_rpmh_vreg_enable(const char *res, unsigned mv)
++{
++	/* Touch rail is left on by lk; nothing to do. Log once. */
++	static int once;
++	if (!once) {
++		printf("ROSEMARY VREG: '%s' %u mV: assumed already enabled by lk (no RPMh on MT6785)\n",
++		       res ? res : "(null)", mv);
++		once = 1;
++	}
++	return 0;
++}
+--- /dev/null
++++ b/bsd/dev/rosemary_spmi.c
+@@ -0,0 +1,121 @@
++/*
++ * rosemary (Redmi Note 10S / MT6785 Helio G95) PMIC access over pwrap.
++ *
++ * Replaces the sweet Qualcomm SPMI driver. On rosemary the PMIC is MT6359,
++ * reached through the MediaTek PMIC wrapper (pwrap@1000d000). We use WACS2
++ * (the non-secure / world-shareable command channel); lk leaves pwrap clocks
++ * and the WACS2 FSM running, so no full re-init is needed -- we only issue
++ * read/write commands and poll for completion.
++ *
++ * Register interface (MT6785 pwrap, mainline drivers/soc/mediatek/mtk-pmic-wrap.c):
++ *   WACS2_CMD   = base + 0x3c0   [31] WRT (1=write,0=read) [30:16] ADDR [15:0] WDATA
++ *   WACS2_RDATA = base + 0x3c4   [15:0] RDATA  (read result; VLD bit is SoC-specific,
++ *                                              we poll by FSM/timeout instead)
++ *   ADDR encoding = (slave_id << 8) | reg_addr; MT6359 slave_id = 0.
++ *
++ * Battery fuel-gauge (MT6359 FG) and AUXADC live in the same register space.
++ */
++#include <stdint.h>
++#include <kern/thread.h>
++#include <vm/vm_map.h>
++#include "rosemary_spmi.h"
++
++#define PWRAP_BASE	0x1000d000UL	/* pwrap@1000d000 (rosemary live FDT) */
++#define WACS2_CMD	0x3c0
++#define WACS2_RDATA	0x3c4
++
++#define WACS_WRT	(1U << 31)
++#define WACS_ADDR(reg)	(((reg) & 0xffff) << 16)	/* slave 0 */
++
++static volatile uint8_t *pwrap_base;
++
++static inline uint32_t pw_rd(unsigned off)  { return *(volatile uint32_t *)(pwrap_base + off); }
++static inline void     pw_wr(unsigned off, uint32_t v) { *(volatile uint32_t *)(pwrap_base + off) = v; }
++
++static void udelay(unsigned us)
++{
++	/* busy-wait on the virtual counter; CNTFRQ is ~13 MHz on MT6785 */
++	uint64_t f = 13000000ULL;
++	uint64_t end;
++	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(end));
++	end += f / 1000000 * us;
++	uint64_t now;
++	do { __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(now)); } while (now < end);
++}
++
++int rosemary_spmi_init(void)
++{
++	extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++	pwrap_base = (volatile uint8_t *)ml_io_map((vm_offset_t)PWRAP_BASE, 0x1000);
++	if (!pwrap_base)
++		return -1;
++	/* WACS2 is left configured by lk; just flush any stale read. */
++	(void)pw_rd(WACS2_RDATA);
++	return 0;
++}
++
++uint16_t rosemary_pwrap_read16(unsigned addr)
++{
++	if (!pwrap_base)
++		return 0;
++	/* Issue read: WRT=0, ADDR=(slv<<8|reg). Then poll for the result. */
++	pw_wr(WACS2_CMD, WACS_ADDR(addr));
++	for (int i = 0; i < 1000; i++) {
++		udelay(1);
++		uint32_t r = pw_rd(WACS2_RDATA);
++		/* On MT6785 WACS2_RDATA returns the last read value once the
++		 * FSM completes; a second read of CMD is harmless. We accept
++		 * after a fixed small delay (lk uses the same ~1 us timeout). */
++		if (i > 2)
++			return (uint16_t)(r & 0xffff);
++	}
++	return (uint16_t)(pw_rd(WACS2_RDATA) & 0xffff);
++}
++
++int rosemary_pwrap_write16(unsigned addr, uint16_t val)
++{
++	if (!pwrap_base)
++		return -1;
++	pw_wr(WACS2_CMD, WACS_WRT | WACS_ADDR(addr) | (val & 0xffff));
++	udelay(5);
++	return 0;
++}
++
++int rosemary_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++{
++	(void)sid;	/* MT6359 is slave 0 */
++	uint16_t v = rosemary_pwrap_read16(addr);
++	if (out) {
++		out[0] = (uint8_t)(v & 0xff);
++		out[1] = (uint8_t)(v >> 8);
++	}
++	return 0;
++}
++
++/* ---- MT6359 AUXADC: battery voltage (channel 15 = VBAT) ----
++ * MT6359 AUXADC registers (mainline mt6359-auxadc):
++ *   CON0   = 0x0c00  (bit0 = channel 0 ... bit15 = channel 15; write to start)
++ *   CON1   = 0x0c02  (same mask, "immediate" mode)
++ *   STATUS = 0x0c06  (bit0 = busy)
++ *   DATA15 = 0x0c26? (per-channel data, 2 bytes each: DATA0=0x0c08, DATA1=0x0c0a ...)
++ * Voltage = raw * 3 / 4096 * (1/3)?? VBAT is divided by 1/3: Vbat = raw*15000/4096 mV?
++ *   MT6359 VBAT channel has 1/3 divider: Vbat_mV = raw * 15000 / 4096.
++ */
++#define AUXADC_CON1	0x0c02
++#define AUXADC_STATUS	0x0c06
++#define AUXADC_DATA15	0x0c26	/* channel 15 (VBAT) data register; verify in mt6359 datasheet */
++
++unsigned rosemary_battery_mv(void)
++{
++	rosemary_pwrap_write16(AUXADC_CON1, 1u << 15);	/* start channel 15 */
++	for (int i = 0; i < 2000; i++) {
++		udelay(10);
++		if (!(rosemary_pwrap_read16(AUXADC_STATUS) & 1))
++			break;
++	}
++	uint16_t raw = rosemary_pwrap_read16(AUXADC_DATA15) & 0x0fff;
++	/* VBAT divider 1/3, reference 1.2 V? MT6359 auxadc full-scale ~1.5V*? 
++	 * Conservative: Vbat_mV = raw * 15000 / 4096. If readings are off by
++	 * exactly 3x, adjust the divisor here. */
++	return (unsigned)raw * 15000U / 4096U;
++}
+--- /dev/null
++++ b/bsd/dev/rosemary_spmi.h
+@@ -0,0 +1,37 @@
++/*
++ * rosemary (Redmi Note 10S / MT6785) PMIC access shim.
++ *
++ * Historical name kept for ABI compatibility with the rest of the port
++ * (Makefiles and callers reference rosemary_spmi_*). On rosemary there is no
++ * SPMI bus: the PMIC (MT6359) sits behind the MediaTek PMIC wrapper (pwrap)
++ * at 0x1000d000. This file exposes the same read interface, implemented over
++ * pwrap WACS2 (non-secure world channel).
++ *
++ * MT6359 slave id = 0. MT6360 (charger/LED, secondary) is not used here.
++ */
++#ifndef ROSEMARY_SPMI_H
++#define ROSEMARY_SPMI_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Initialize pwrap (leave clocks as the bootloader set them). Returns 0 on success. */
++int rosemary_spmi_init(void);
++
++/* Read one 16-bit PMIC register. `sid` is ignored (MT6359 = slave 0); kept for API compat. */
++int rosemary_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++/* Write one 16-bit PMIC register (added for rosemary; sweet only had read). */
++int rosemary_pwrap_write16(unsigned addr, uint16_t val);
++
++/* Read one 16-bit PMIC register directly. */
++uint16_t rosemary_pwrap_read16(unsigned addr);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ROSEMARY_SPMI_H */
+--- /dev/null
++++ b/iokit/Kernel/arm/RosemaryBattery.cpp
+@@ -0,0 +1,319 @@
++/*
++ * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
++ * rosemarybattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
++ * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
++ * See report.md for binary evidence, register provenance and integration.
++ */
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++#include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <pexpert/pexpert.h>
++/* bsd/dev/rosemary_spmi.c */
++extern "C" int rosemary_spmi_init(void);
++extern "C" int rosemary_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++class RosemaryBattery : public IOPMPowerSource {
++	OSDeclareDefaultStructors(RosemaryBattery);
++public:
++	bool init(OSDictionary *dictionary = NULL) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++private:
++	IOWorkLoop *fLoop;
++	IOTimerEventSource *fTimer;
++	bool fTimerAdded, fRunning, fReal;
++	int fLastMode;
++	void putNumber(const char *key, UInt32 value);
++	void putBool(const char *key, bool value);
++	void publish(unsigned percent, unsigned mv, int ma, bool external,
++	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	void poll(void);
++	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
++	static bool readWord(unsigned address, uint16_t *value);
++	static unsigned estimatePercent(unsigned mv);
++};
++OSDefineMetaClassAndStructors(RosemaryBattery, IOPMPowerSource);
++
++bool
++RosemaryBattery::init(OSDictionary *dictionary)
++{
++	/* IOCatalogue calls init(dictionary). This XNU's IOPMPowerSource only
++	 * overrides init(void): explicitly run it to allocate its PS dictionary
++	 * and symbols, then copy the matching personality into the registry. */
++	if (!IOPMPowerSource::init()) {
++		return false;
++	}
++	fLoop = NULL;
++	fTimer = NULL;
++	fTimerAdded = fRunning = fReal = false;
++	if (dictionary) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
++		if (!it) {
++			return false;
++		}
++		OSObject *object;
++		bool ok = true;
++		while ((object = it->getNextObject())) {
++			const OSSymbol *key = OSDynamicCast(OSSymbol, object);
++			if (!key || !setProperty(key, dictionary->getObject(key))) {
++				ok = false;
++				break;
++			}
++		}
++		it->release();
++		if (!ok) {
++			return false;
++		}
++	}
++	fLastMode = -1;
++	return true;
++}
++
++void
++RosemaryBattery::putNumber(const char *key, UInt32 value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	OSNumber *number = OSNumber::withNumber(value, 32);
++	if (symbol && number) {
++		setPSProperty(symbol, number);
++	}
++	OSSafeReleaseNULL(number);
++	OSSafeReleaseNULL(symbol);
++}
++
++void
++RosemaryBattery::putBool(const char *key, bool value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	if (symbol) {
++		setPSProperty(symbol, value ? kOSBooleanTrue : kOSBooleanFalse);
++		symbol->release();
++	}
++}
++
++void
++RosemaryBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
++    bool capable, bool charging, bool full, bool measured, bool currentValid)
++{
++	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
++	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	setBatteryInstalled(true);
++	setCurrentCapacity(capacity);
++	setMaxCapacity(5020);
++	setExternalConnected(external);
++	setExternalChargeCapable(capable);
++	setIsCharging(charging);
++	setAtWarnLevel(false);
++	/* An uncalibrated voltage curve must not assert a critical shutdown. */
++	setAtCriticalLevel(false);
++	setVoltage(mv);
++	setAmperage(ma);
++	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
++	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	putBool("FullyCharged", full);
++	putBool("AppleRawExternalConnected", external);
++	putNumber("AppleRawCurrentCapacity", capacity);
++	putNumber("AppleRawMaxCapacity", 5020);
++	putNumber("DesignCapacity", 5020);
++	putNumber("InstantAmperage", (UInt32)ma);
++	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
++	putNumber("Temperature", 2500);
++	putBool("RosemaryBatteryHardwareSampleValid", measured);
++	putBool("RosemaryBatteryCurrentValid", currentValid);
++	putBool("RosemaryBatterySOCEstimated", measured);
++	putBool("RosemaryBatteryTemperatureEstimated", true);
++	putBool("RosemaryBatteryFallback", !measured);
++	putNumber("RosemaryBatteryPercent", percent);
++
++	/* IOPMCopyBatteryInfo's per-source compatibility dictionary. */
++	OSDictionary *legacy = OSDictionary::withCapacity(7);
++	if (legacy) {
++		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
++		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
++		    kIOBatteryFlagsKey};
++		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
++		    (charging ? kIOBatteryCharge : 0))};
++		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++			OSNumber *number = OSNumber::withNumber(values[i], 32);
++			if (number) {
++				legacy->setObject(keys[i], number);
++				number->release();
++			}
++		}
++		setLegacyIOBatteryInfo(legacy);
++		legacy->release();
++	}
++	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
++	int mode = measured ? 1 : 0;
++	if (mode != fLastMode) {
++		IOLog("ROSEMARY BATTERY: %s, %u%% %umV external=%d charging=%d\n",
++		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    percent, mv, external, charging);
++		fLastMode = mode;
++	}
++}
++
++/* Keep the proven single-byte observer command. Read two matching whole
++ * words to reject most torn ADC samples without writing the QG HOLD bit.
++ * This is a bounded consistency check, not a hardware snapshot guarantee. */
++bool
++RosemaryBattery::readWord(unsigned address, uint16_t *value)
++{
++	uint16_t previous = 0;
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t lo, hi;
++		if (rosemary_spmi_read(0, address, &lo) ||
++		    rosemary_spmi_read(0, address + 1, &hi)) {
++			return false;
++		}
++		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++		if (attempt && next == previous) {
++			*value = next;
++			return true;
++		}
++		previous = next;
++	}
++	return false;
++}
++
++unsigned
++RosemaryBattery::estimatePercent(unsigned mv)
++{
++	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
++	 * Load sag, temperature, aging and charging introduce large errors. */
++	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
++	    4000, 4100, 4200, 4350};
++	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
++	if (mv <= volts[0]) {
++		return soc[0];
++	}
++	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
++		if (mv < volts[i]) {
++			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
++			       (volts[i] - volts[i - 1]);
++		}
++	}
++	return 100;
++}
++
++void
++RosemaryBattery::poll(void)
++{
++	uint8_t type, present, usb, path, charger, error, temperature;
++	uint16_t rawVoltage;
++	bool valid = fReal &&
++	    !rosemary_spmi_read(0, 0x4804, &type) && type == 0x0d &&
++	    !rosemary_spmi_read(0, 0x4808, &present) && (present & 1u) &&
++	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
++	    !rosemary_spmi_read(0, 0x1310, &usb) &&
++	    !rosemary_spmi_read(0, 0x110b, &path) &&
++	    !rosemary_spmi_read(0, 0x1006, &charger) &&
++	    !rosemary_spmi_read(0, 0x1007, &error) &&
++	    !rosemary_spmi_read(0, 0x100d, &temperature);
++	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
++	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
++	valid = valid && mv >= 2800 && mv <= 4600;
++	if (!valid) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	bool external = (usb & 0x10u) != 0;
++	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++	unsigned state = charger & 7u;
++	bool charging = capable && state >= 1 && state <= 4 &&
++	    !(error & 2u) && !(temperature & 0x0cu);
++	/* Inhibit (0) does not by itself establish full capacity. */
++	bool full = external && state == 5 && !(error & 2u);
++	int ma = 0;
++	uint8_t subtype;
++	uint16_t rawCurrent;
++	bool currentValid = !rosemary_spmi_read(0, 0x4805, &subtype) &&
++	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
++	    rawCurrent != 0x8000;
++	if (currentValid) {
++		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
++		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
++		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
++	}
++	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
++	    charging, full, true, currentValid);
++}
++
++void
++RosemaryBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	RosemaryBattery *self = OSDynamicCast(RosemaryBattery, owner);
++	if (self && self->fRunning) {
++		self->poll();
++		sender->setTimeoutMS(30000);
++	}
++}
++
++bool
++RosemaryBattery::start(IOService *provider)
++{
++	if (!IOPMPowerSource::start(provider)) {
++		return false;
++	}
++	int real = 0;
++	(void)PE_parse_boot_argn("rosemarybattery", &real, sizeof(real));
++	fReal = real == 1 && rosemary_spmi_init() == 0;
++	/* Publish a complete source BEFORE registerService wakes powerd. */
++	poll();
++	if (fReal) {
++		fLoop = IOWorkLoop::workLoop();
++		fTimer = IOTimerEventSource::timerEventSource(this, &RosemaryBattery::timerFired);
++		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
++			fTimerAdded = true;
++			fRunning = true;
++			fTimer->setTimeoutMS(30000);
++		} else {
++			fReal = false;
++			poll();
++			IOLog("ROSEMARY BATTERY: timer unavailable; static fallback\n");
++		}
++	}
++	registerService();
++	return true;
++}
++
++void
++RosemaryBattery::stop(IOService *provider)
++{
++	if (fLoop && fTimerAdded) {
++		/* Serialize against a running timer callback, including rearming. */
++		(void)fLoop->runAction(&RosemaryBattery::stopPolling, this);
++		fLoop->removeEventSource(fTimer);
++		fTimerAdded = false;
++	}
++	IOPMPowerSource::stop(provider);
++}
++
++IOReturn
++RosemaryBattery::stopPolling(OSObject *owner, void *, void *, void *, void *)
++{
++	RosemaryBattery *self = OSDynamicCast(RosemaryBattery, owner);
++	if (!self) {
++		return kIOReturnBadArgument;
++	}
++	self->fRunning = false;
++	self->fTimer->cancelTimeout();
++	self->fTimer->disable();
++	return kIOReturnSuccess;
++}
++
++void
++RosemaryBattery::free(void)
++{
++	OSSafeReleaseNULL(fTimer);
++	OSSafeReleaseNULL(fLoop);
++	IOPMPowerSource::free();
++}
++#endif /* ARM64_BOARD_CONFIG_ROSEMARY */
