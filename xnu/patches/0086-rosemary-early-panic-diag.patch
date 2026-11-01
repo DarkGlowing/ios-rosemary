@@ -1,21 +1,19 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: rosemary port <port@local>
-Date: Sun, 1 Nov 2026 18:10:00 +0500
-Subject: [PATCH] osfmk/arm64: noinline early-panic diagnostic (regs + stack)
+Date: Sun, 1 Nov 2026 18:05:00 +0500
+Subject: [PATCH] osfmk/arm64: wider early-panic stack window (2048 words)
 
-The panic hook itself is merged into a cold path by the optimiser when the
-diagnostic lives inline, so it never runs. Move it into a separate noinline
-function and call it as the first statement of the hook: print ESR/FAR/ELR/
-SPSR/TPIDR plus the stack words that look like kernel text addresses, then
-spin in wfe so the frame can be photographed.
+The first panic dies inside panic_with_thread_kernel_state before it can
+print anything, so the frames we need sit just past the previous 768-word
+window. Scan 2048 words and drop consecutive duplicates.
 
 ---
- osfmk/arm64/rosemary_early.c | 69 ++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 69 insertions(+)
+ osfmk/arm64/rosemary_early.c | 71 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 71 insertions(+)
 
 --- a/osfmk/arm64/rosemary_early.c
 +++ b/osfmk/arm64/rosemary_early.c
-@@ -109,6 +109,56 @@
+@@ -109,6 +109,57 @@
  	rosemary_early_putc('\n');
  }
  
@@ -54,9 +52,10 @@ spin in wfe so the frame can be photographed.
 +	rosemary_early_string(" tpidr=");
 +	rosemary_early_hex64(tpidr);
 +	rosemary_early_string("\n  stack:");
-+	for (unsigned int i = 0; i < 768; i++) {
++	for (unsigned int i = 0; i < 2048; i++) {
 +		uint64_t v = stk[i];
-+		if (v >= 0xfffffe0007004000ULL && v < 0xfffffe0008108000ULL) {
++		if (v >= 0xfffffe0007004000ULL && v < 0xfffffe0008108000ULL &&
++		    v != (i ? stk[i - 1] : 0)) {
 +			rosemary_early_putc(' ');
 +			rosemary_early_hex64(v);
 +		}
@@ -72,7 +71,7 @@ spin in wfe so the frame can be photographed.
  void
  rosemary_early_panic(const char *fmt, va_list *args)
  {
-@@ -116,6 +166,8 @@
+@@ -116,6 +167,8 @@
  		return;
  	}
  	early_panicking = 1;
