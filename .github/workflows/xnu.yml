@@ -1,0 +1,176 @@
+name: xnu
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_version:
+        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
+        default: "13.5"
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG
+        default: ROSEMARY
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+  push:
+    branches: [main]
+    paths:
+      - "xnu/patches/**"
+      - ".github/workflows/xnu.yml"
+
+concurrency:
+  group: xnu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'ROSEMARY' }}
+
+jobs:
+  build:
+    # macos-14 is retired on 2026-11-02. macos-15 ships Xcode 16.x, whose iig
+    # emits IORPC.kernelContent; patch 0089 backports that field from xnu-11215.
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # libfirehose_kernel is built arm64e-only; the ROSEMARY kernel is plain arm64
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          ls dxb/patches
+          echo "--- patch fingerprint ---"
+          shasum -a 256 dxb/patches/0010-*.patch dxb/patches/0086-*.patch dxb/patches/0088-*.patch dxb/patches/0089-*.patch || true
+          echo "diag lines in 0086: $(grep -c 'rosemary_early_hex64' dxb/patches/0086-*.patch || true)"
+          echo "stride lines in 0010: $(grep -c '4352' dxb/patches/0010-*.patch || true)"
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja
+          # build.sh only checks that xcodes exists (Xcode is preinstalled)
+          printf '#!/bin/sh\nexit 0\n' > /tmp/xcodes-stub
+          sudo install -m 755 /tmp/xcodes-stub /usr/local/bin/xcodes
+          BREW_BIN=$(brew --prefix)/bin
+          [ -d "$BREW_BIN" ] && sudo install -m 755 /tmp/xcodes-stub "$BREW_BIN/xcodes"
+          export PATH="$(brew --prefix)/bin:$PATH"
+          sw_vers
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+          echo "SDK=$(xcrun --sdk macosx --show-sdk-path)"
+          echo "--- KDKs present (build.sh downloads the 13.5 one if missing) ---"
+          ls -1 /Library/Developer/KDKs 2>/dev/null || echo "none"
+
+      - name: Force full rebuild (defeat stale objects)
+        run: |
+          # The build tree may carry objects whose timestamps beat the patched
+          # sources; touch everything so every patched file is recompiled.
+          find dxb/xnu dxb/build -type f -exec touch -m {} + 2>/dev/null || true
+          echo "touched $(find dxb/xnu -type f 2>/dev/null | wc -l) source files"
+
+      - name: Build
+        working-directory: dxb
+        env:
+          # keep going after errors so one run reports every compile failure
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+        run: bash build.sh
+
+      - name: Verify the patched source really has the diag
+        if: always()
+        run: |
+          echo "--- patched rosemary_early.c ---"
+          ls -l dxb/xnu/osfmk/arm64/rosemary_early.c 2>&1 || true
+          grep -c 'rosemary_early_hex64' dxb/xnu/osfmk/arm64/rosemary_early.c 2>&1 || true
+          grep -c 'stack:' dxb/xnu/osfmk/arm64/rosemary_early.c 2>&1 || true
+          echo "--- iorpc fix (0089) ---"
+          grep -n 'kernelContent' dxb/xnu/iokit/IOKit/IORPC.h || echo "IORPC.kernelContent MISSING - 0089 did not apply"
+          echo "--- produced kernel ---"
+          ls -l dxb/fakeroot/System/Library/Kernels/ 2>&1 || true
+          shasum -a 256 dxb/fakeroot/System/Library/Kernels/* 2>&1 || true
+
+      - name: Verify USB root integration in source and kernel
+        if: env.MACHINE_CONFIG == 'ROSEMARY'
+        run: |
+          set -eu
+          git apply --numstat xnu/patches/0093-rosemary-usbmsc.patch
+          cmp xnu/additions/rosemary_usbmsc.c dxb/xnu/bsd/dev/rosemary_usbmsc.c
+          grep -F 'bsd/dev/rosemary_usbmsc.c' dxb/xnu/bsd/conf/files
+          grep -F 'rosemary_usbmsc_rootdev(root)' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp
+          mkdir -p out
+          found=0
+          for kernel in dxb/fakeroot/System/Library/Kernels/kernel.*; do
+            [ -f "$kernel" ] || continue
+            if xcrun nm "$kernel" > out/usbmsc-symbols.txt 2> out/usbmsc-nm.log; then
+              if grep -E '[[:space:]][Tt][[:space:]]_rosemary_usbmsc_rootdev$' out/usbmsc-symbols.txt; then
+                found=1
+                break
+              fi
+            fi
+          done
+          [ "$found" -eq 1 ] || { echo 'USB root symbol missing: integration unverified'; exit 1; }
+
+      - name: Package build tree for local compiles
+        if: always()
+        run: |
+          # Generated headers, config option headers, mig output and the patched
+          # source: enough to re-run any single compile command from the log locally.
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          mkdir -p sdk-kernel-platform
+          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+          tar czf buildtree.tgz \
+            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
+            --exclude='kernel.development.*' --exclude='.git' \
+            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C .. sdk-kernel-platform
+          ls -la buildtree.tgz
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-buildtree
+          path: buildtree.tgz
+          retention-days: 7
+
+      - name: Inspect closed KDK support libs
+        if: always()
+        run: |
+          mkdir -p out/kdk-libs
+          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            [ -e "$lib" ] || continue
+            b=$(basename "$lib" .a)
+            ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
+            nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
+            lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
+          done
+          ls -la out/kdk-libs
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel
+          path: out/
+          if-no-files-found: warn

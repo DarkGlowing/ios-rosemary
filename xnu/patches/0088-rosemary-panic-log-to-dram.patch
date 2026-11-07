@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rosemary port <port@local>
+Date: Sun, 1 Nov 2026 19:20:00 +0500
+Subject: [PATCH] osfmk/arm64: keep the early panic log in DRAM for the shim
+
+The framebuffer console wraps after 74 rows, so a 2048-word stack dump loses
+its own header and cannot be read off a photograph. Mirror every console
+character into a 32 KiB static buffer instead (__DATA, physically contiguous,
+survives the watchdog reset), record the length in a "RXNULOG1" header and
+flush the cache every 512 characters so a fault mid-dump keeps what was
+written. The screen copy stays bounded to ~21 rows; the rest of the dump only
+goes to the log.
+
+shim/xnulog.c finds the buffer on the next boot and copies it to expdb.
+---
+diff --git a/osfmk/arm64/rosemary_early.c b/osfmk/arm64/rosemary_early.c
+index f45d29e..7dbbfc7 100644
+--- a/osfmk/arm64/rosemary_early.c
++++ b/osfmk/arm64/rosemary_early.c
+@@ -28,6 +28,67 @@ extern unsigned char iso_font[256 * 16];
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+ 
++/*
++ * Persistent log sink
++ * -------------------
++ * The console is a 67x74 character window that wraps, so a full stack dump
++ * cannot be photographed and the header is gone as soon as the dump is longer
++ * than one screen. Mirror every character into a static buffer instead: it
++ * lands in __DATA, is physically contiguous, and survives the watchdog reset
++ * in DRAM. The shim (shim/xnulog.c) finds it on the next boot and copies it
++ * into the expdb partition, which Android never mounts, so a panic can be read
++ * back as a file:
++ *
++ *   adb shell 'dd if=/dev/block/by-name/expdb of=/sdcard/xnulog.bin bs=4096 count=9'
++ *
++ * Layout: [0..7] "RXNULOG1", [8..11] length (LE32), [16..] text.
++ */
++#define ROSEMARY_LOG_MAX (32u * 1024u)
++
++static volatile char rosemary_log[ROSEMARY_LOG_MAX] __attribute__((aligned(4096), used));
++static unsigned int rosemary_log_len;
++
++/* __DATA is Normal write-back: without this the last lines would still be
++ * sitting dirty in the cache when the watchdog resets the SoC. */
++static void
++rosemary_log_flush(void)
++{
++	uintptr_t a = (uintptr_t)rosemary_log & ~(uintptr_t)63;
++	uintptr_t end = (uintptr_t)rosemary_log + 16 + rosemary_log_len;
++
++	for (; a < end; a += 64) {
++		__asm__ volatile("dc cvac, %0" : : "r"(a) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++rosemary_log_putc(char c)
++{
++	static const char magic[8] = { 'R', 'X', 'N', 'U', 'L', 'O', 'G', '1' };
++
++	if (rosemary_log[0] != 'R') {
++		for (unsigned int i = 0; i < 8; i++) {
++			rosemary_log[i] = magic[i];
++		}
++		rosemary_log_len = 0;
++	}
++	if (rosemary_log_len >= ROSEMARY_LOG_MAX - 17) {
++		return;
++	}
++	rosemary_log[16 + rosemary_log_len++] = c;
++	uint32_t len = rosemary_log_len;
++	rosemary_log[8] = (char)len;
++	rosemary_log[9] = (char)(len >> 8);
++	rosemary_log[10] = (char)(len >> 16);
++	rosemary_log[11] = (char)(len >> 24);
++	/* A fault in the middle of a dump must still leave a usable log: flush
++	 * often enough that at most a few hundred characters are at risk. */
++	if ((rosemary_log_len & 511) == 0) {
++		rosemary_log_flush();
++	}
++}
++
+ static void
+ rosemary_early_clear_row(void)
+ {
+@@ -42,6 +103,7 @@ rosemary_early_clear_row(void)
+ void
+ rosemary_early_putc(char c)
+ {
++	rosemary_log_putc(c);
+ 	if (early_disabled) {
+ 		return;
+ 	}
+@@ -109,21 +171,49 @@ rosemary_early_mark(unsigned int stage, const char *label)
+ 	rosemary_early_putc('\n');
+ }
+ 
++#define ROSEMARY_SCREEN_BUDGET 1400u	/* ~21 rows of 67 characters; no wrap */
++
++static void
++diag_putc(char c, unsigned int *budget)
++{
++	if (*budget) {
++		*budget -= 1;
++		rosemary_early_putc(c);	/* also mirrors into the RAM log */
++	} else {
++		rosemary_log_putc(c);	/* screen is full: RAM log only */
++	}
++}
++
+ static void
+-rosemary_early_hex64(uint64_t v)
++diag_str(const char *s, unsigned int *budget)
++{
++	while (*s) {
++		diag_putc(*s++, budget);
++	}
++}
++
++static void
++rosemary_early_hex64(uint64_t v, unsigned int *budget)
+ {
+ 	for (int sh = 60; sh >= 0; sh -= 4) {
+ 		unsigned int d = (unsigned int)((v >> sh) & 0xf);
+-		rosemary_early_putc((char)(d < 10 ? '0' + d : 'a' + d - 10));
++		diag_putc((char)(d < 10 ? '0' + d : 'a' + d - 10), budget);
+ 	}
+ }
+ 
++/*
++ * Called from the first line of the panic hook. Whatever is on the screen is
++ * also in the RAM log, and the log keeps going after the screen budget is
++ * spent, so the whole 2048-word stack window survives even though only the
++ * first ~80 addresses fit on the panel.
++ */
+ __attribute__((noinline, used)) static void
+ rosemary_early_diag(void)
+ {
+ 	uint64_t esr, far, elr, spsr, tpidr;
+ 	uintptr_t sp;
+ 	volatile uint64_t *stk;
++	unsigned int budget = ROSEMARY_SCREEN_BUDGET;
+ 
+ 	__asm__ volatile("mrs %0, esr_el1" : "=r"(esr));
+ 	__asm__ volatile("mrs %0, far_el1" : "=r"(far));
+@@ -133,27 +223,30 @@ rosemary_early_diag(void)
+ 	__asm__ volatile("mov %0, sp" : "=r"(sp));
+ 	stk = (volatile uint64_t *)sp;
+ 
+-	rosemary_early_string("ROSEMARY DIAG\n  esr=");
+-	rosemary_early_hex64(esr);
+-	rosemary_early_string(" far=");
+-	rosemary_early_hex64(far);
+-	rosemary_early_string("\n  elr=");
+-	rosemary_early_hex64(elr);
+-	rosemary_early_string(" spsr=");
+-	rosemary_early_hex64(spsr);
+-	rosemary_early_string(" tpidr=");
+-	rosemary_early_hex64(tpidr);
+-	rosemary_early_string("\n  stack:");
++	diag_str("ROSEMARY DIAG\n  esr=", &budget);
++	rosemary_early_hex64(esr, &budget);
++	diag_str(" far=", &budget);
++	rosemary_early_hex64(far, &budget);
++	diag_str("\n  elr=", &budget);
++	rosemary_early_hex64(elr, &budget);
++	diag_str(" spsr=", &budget);
++	rosemary_early_hex64(spsr, &budget);
++	diag_str("\n  tpidr=", &budget);
++	rosemary_early_hex64(tpidr, &budget);
++	diag_str(" sp=", &budget);
++	rosemary_early_hex64((uint64_t)sp, &budget);
++	diag_str("\n  stack:", &budget);
+ 	for (unsigned int i = 0; i < 2048; i++) {
+ 		uint64_t v = stk[i];
+ 		if (v >= 0xfffffe0007004000ULL && v < 0xfffffe0008108000ULL &&
+ 		    v != (i ? stk[i - 1] : 0)) {
+-			rosemary_early_putc(' ');
+-			rosemary_early_hex64(v);
++			diag_putc(' ', &budget);
++			rosemary_early_hex64(v, &budget);
+ 		}
+ 	}
+-	rosemary_early_string("\n");
++	diag_str("\n  END", &budget);
+ 
++	rosemary_log_flush();
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	for (;;) {
+ 		__asm__ volatile("wfe");

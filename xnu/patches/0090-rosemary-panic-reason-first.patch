@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rosemary port <port@local>
+Date: Sun, 1 Nov 2026 21:05:00 +0500
+Subject: [PATCH] osfmk/arm64: print the panic reason first, keep the stack walk in bounds
+
+The RAM log from the last run came back with 1288 bytes and no panic text: the
+hook dumped registers and started the stack walk before printing the reason,
+and the walk ran off the top of the 16 KiB kernel stack, taking a second data
+abort that killed the dump mid-line. Print the formatted reason first, then
+registers, and bound the scan to the first 16 KiB boundary above sp.
+---
+diff --git a/osfmk/arm64/rosemary_early.c b/osfmk/arm64/rosemary_early.c
+index 7dbbfc7..231c541 100644
+--- a/osfmk/arm64/rosemary_early.c
++++ b/osfmk/arm64/rosemary_early.c
+@@ -236,7 +236,17 @@ rosemary_early_diag(void)
+ 	diag_str(" sp=", &budget);
+ 	rosemary_early_hex64((uint64_t)sp, &budget);
+ 	diag_str("\n  stack:", &budget);
+-	for (unsigned int i = 0; i < 2048; i++) {
++	/* Stay inside the current 16 KiB kernel stack: its top is the first
++	 * 16 KiB boundary above sp, and reading past it takes a second data
++	 * abort -- which is what truncated the previous dump at 1288 bytes. */
++	uintptr_t top = ((uintptr_t)sp | 0x3fffUL) + 1;
++	unsigned int nwords = (unsigned int)((top - (uintptr_t)sp) / 8) + 1;
++	if (nwords > 2048) {
++		nwords = 2048;
++	}
++	diag_str(" top=", &budget);
++	rosemary_early_hex64((uint64_t)top, &budget);
++	for (unsigned int i = 0; i < nwords; i++) {
+ 		uint64_t v = stk[i];
+ 		if (v >= 0xfffffe0007004000ULL && v < 0xfffffe0008108000ULL &&
+ 		    v != (i ? stk[i - 1] : 0)) {
+@@ -260,8 +270,8 @@ rosemary_early_panic(const char *fmt, va_list *args)
+ 		return;
+ 	}
+ 	early_panicking = 1;
+-	rosemary_early_diag();
+-	/* not reached */
++	/* Reason first: the register dump and the stack walk below can fault on
++	 * their own, and the last run died before it ever printed this. */
+ 	rosemary_early_string("\nROSEMARY EARLY PANIC: ");
+ 	va_list copy;
+ 	va_copy(copy, *args);
+@@ -269,6 +279,11 @@ rosemary_early_panic(const char *fmt, va_list *args)
+ 	va_end(copy);
+ 	rosemary_early_putc('\n');
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	rosemary_early_diag();
++	/* not reached */
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
+ }
+ 
+ void

@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rosemary port <port@local>
+Date: Mon, 2 Nov 2026 17:20:00 +0500
+Subject: [PATCH] osfmk/arm64: give the panic dump the whole screen
+
+The dump was capped at ~21 rows to keep it from wrapping, so only the first
+few dozen stack words were ever visible. Clear the panel black as soon as the
+panic hook takes over (the shim's blue console is hidden, not removed) and let
+the dump use ~62 of the 74 rows instead.
+---
+diff --git a/osfmk/arm64/rosemary_early.c b/osfmk/arm64/rosemary_early.c
+index 231c541..0b013c6 100644
+--- a/osfmk/arm64/rosemary_early.c
++++ b/osfmk/arm64/rosemary_early.c
+@@ -100,6 +100,24 @@ rosemary_early_clear_row(void)
+ 	}
+ }
+ 
++/* Wipe the whole panel black so the panic output owns the screen: the shim's
++ * blue console underneath is hidden, not removed. 67 columns x 74 rows. */
++static void
++rosemary_early_screen_clear(void)
++{
++	for (unsigned int y = 0; y < EARLY_HEIGHT; y++) {
++		volatile uint32_t *line = EARLY_FB + y * EARLY_STRIDE;
++
++		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
++			line[x] = 0xff000000u;
++		}
++	}
++	early_row = 0;
++	early_col = 0;
++	early_started = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ void
+ rosemary_early_putc(char c)
+ {
+@@ -171,7 +189,7 @@ rosemary_early_mark(unsigned int stage, const char *label)
+ 	rosemary_early_putc('\n');
+ }
+ 
+-#define ROSEMARY_SCREEN_BUDGET 1400u	/* ~21 rows of 67 characters; no wrap */
++#define ROSEMARY_SCREEN_BUDGET 4200u	/* ~62 of 74 rows: the panel minus the panic text above */
+ 
+ static void
+ diag_putc(char c, unsigned int *budget)
+@@ -270,6 +288,8 @@ rosemary_early_panic(const char *fmt, va_list *args)
+ 		return;
+ 	}
+ 	early_panicking = 1;
++	/* Take the whole panel, then print on a clean black screen. */
++	rosemary_early_screen_clear();
+ 	/* Reason first: the register dump and the stack walk below can fault on
+ 	 * their own, and the last run died before it ever printed this. */
+ 	rosemary_early_string("\nROSEMARY EARLY PANIC: ");

@@ -1,0 +1,535 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@
+ bsd/dev/rosemary_keys.c			standard
+ bsd/dev/rosemary_touch.c			standard
+ bsd/dev/mem.c				standard
++bsd/dev/rosemary_usbmsc.c		standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+ 
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -784,6 +784,21 @@
+ 	}
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++	if (strcmp(rdBootVar, "usbroot0") == 0) {
++		extern int rosemary_usbmsc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int usb_error = rosemary_usbmsc_rootdev(root);
++		if (usb_error) {
++			panic("IOFindBSDRoot: usbroot0 unavailable: %d", usb_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ //
+ //	Now check if we are trying to root on a memory device
+ //
+diff --git a/bsd/dev/rosemary_usbmsc.c b/bsd/dev/rosemary_usbmsc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -0,0 +1,494 @@
++/*
++ * ROSEMARY USB mass-storage root device (xHCI, MT6785) -- kernel port.
++ *
++ * Register sequences are ported from the shim, where they were proven on
++ * this exact phone: bulk IN/OUT completion 1, INQUIRY, READ CAPACITY,
++ * READ(10), and an HFSX lookup that printed 16.7.16 / 20H392 from the stick.
++ *
++ * Layout of the contiguous DMA pool (offsets in bytes):
++ *   0x0000 cmd ring 32 TRB | 0x0400 evt ring 32 TRB | 0x0600 ERST[1]
++ *   0x0700 DCBAA | 0x0740 input ctx (6*32) | 0x0800 device ctx (1 KiB)
++ *   0x0c00 bulk-in ring | 0x0e00 bulk-out ring | 0x1000 data buffer 8 KiB
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <machine/machine_routines.h>
++#include <osfmk/arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++#define U3PHY_BASE	0x11e40000UL
++#define IPPC_BASE	0x11203e00UL
++#define INFRA_AO	0x10001000UL
++#define XHCI_BASE	0x11200020UL
++
++#define INFRA2_CLR	0xa8
++#define INFRA0_CLR	0x84
++#define INFRA1_CLR	0x8c
++
++#define IPPC_PW_CTRL0	0x00
++#define IPPC_PW_CTRL1	0x04
++#define PHY_U2_COM	(U3PHY_BASE + 0x300)
++#define PHY_PHYA_REG1	(U3PHY_BASE + 0xb04)
++#define PHY_U2PHYDTM0	(PHY_U2_COM + 0x68)
++#define PHY_U2PHYDTM1	(PHY_U2_COM + 0x6c)
++#define PHY_U2PHYACR4	(PHY_U2_COM + 0x20)
++#define PHY_USBPHYACR6	(PHY_U2_COM + 0x18)
++#define RG_SSUSB_VUSB10_ON	(1u << 29)
++#define RG_UART_MODE_MASK	(3u << 30)
++#define RG_UART_EN		(1u << 16)
++#define RG_USB20_GPIO_CTL	(1u << 9)
++#define RG_USB20_DP_100K_MODE	(1u << 18)
++#define RG_USB20_DM_100K_EN	(1u << 17)
++#define RG_USB20_BC11_SW_EN	(1u << 23)
++#define RG_USB20_OTG_VBUSCMP_EN	(1u << 20)
++#define USB20_GPIO_MODE		(1u << 7)
++#define USB20_DP_100K_EN	(1u << 16)
++#define FORCE_UART_EN		(1u << 30)
++#define FORCE_SUSPENDM		(1u << 29)
++
++#define XO_USBCMD	0x00
++#define XO_USBSTS	0x04
++#define XO_PAGESIZE	0x08
++#define XO_CRCR		0x18
++#define XO_DCBAAP	0x30
++#define XO_CONFIG	0x38
++#define XO_PORTSC	0x400
++#define XO_RT_BASE	0x5e0
++#define XO_DB_BASE	0x7e0
++#define RT_ERSTSZ	0x08
++#define RT_ERSTBA	0x10
++#define RT_ERDP		0x18
++
++#define USBCMD_RUN	(1u << 0)
++#define USBCMD_HCRST	(1u << 1)
++#define USBSTS_HALT	(1u << 0)
++#define USBSTS_CNR	(1u << 11)
++#define USBSTS_EINT	(1u << 3)
++#define PORTSC_CCS	(1u << 0)
++#define PORTSC_PED	(1u << 1)
++#define PORTSC_PR	(1u << 4)
++#define PORTSC_PP	(1u << 9)
++#define PORTSC_CSC	(1u << 17)
++#define PORTSC_PRC	(1u << 21)
++
++#define CMD_ENABLE_SLOT		9
++#define CMD_ADDRESS_DEVICE	11
++#define CMD_CONFIGURE_EP	12
++
++#define RING_TRBS	32
++#define POOL_SIZE	0x3000
++#define OFF_DCBC	0x0700
++#define OFF_ICTX	0x0740
++#define OFF_DCTX	0x0800
++#define OFF_BIN		0x0c00
++#define OFF_BOUT	0x0e00
++#define OFF_DATA	0x1000
++#define DATA_SIZE	0x2000
++
++struct usbmsc {
++	vm_offset_t op, ippc, phy, infra;
++	vm_offset_t pool;
++	uint64_t pool_pa;
++	uint32_t *cmd;  uint64_t cmd_pa;  int cmd_i, cmd_c;
++	uint32_t *evt;  uint64_t evt_pa;  int evt_i;
++	uint32_t *dcb;  uint64_t dcb_pa;
++	uint32_t *ictx; uint64_t ictx_pa;
++	uint32_t *dctx; uint64_t dctx_pa;
++	uint32_t *bin;  uint64_t bin_pa;  int bin_i, bin_c;
++	uint32_t *bout; uint64_t bout_pa; int bout_i, bout_c;
++	uint8_t *data;  uint64_t data_pa;
++	uint32_t port, slot, dci_in, dci_out, mps_in, mps_out;
++	uint32_t sectors, tag;
++	int bmajor;
++	dev_t bdev;
++	bool ready;
++};
++
++static struct usbmsc sc;
++static int usbmsc_enable = 1;
++
++static inline uint32_t rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
++static void udelay(uint32_t us) { delay_for_interval(us, 1000); }
++
++static inline uint32_t *ring(uint32_t *base, int i) { return base + i * 4; }
++
++/* ---- DMA pool -------------------------------------------------------- */
++static bool pool_alloc(void)
++{
++	uint32_t pages = POOL_SIZE / PAGE_SIZE;
++	ppnum_t first;
++	uint32_t i;
++
++	sc.pool = kmem_alloc_contig(kernel_map, POOL_SIZE, 0, 0xFFFFFFFFull,
++				    PAGE_SIZE, 0, VM_PROT_READ | VM_PROT_WRITE);
++	if (!sc.pool)
++		return false;
++	first = pmap_find_phys(kernel_pmap, (addr64_t)sc.pool);
++	if (!first)
++		return false;
++	for (i = 1; i < pages; i++)
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(sc.pool + i * PAGE_SIZE)) != first + i)
++			return false;	/* must be physically contiguous for DMA */
++	sc.pool_pa = (uint64_t)ptoa_64(first);
++	bzero((void *)sc.pool, POOL_SIZE);
++	return true;
++}
++
++/* ---- controller bring-up (ported from the shim) ---------------------- */
++static int wait_bits(vm_offset_t b, uint32_t o, uint32_t m, uint32_t v, uint32_t us)
++{
++	while (us--) {
++		if ((rd(b, o) & m) == v)
++			return 0;
++		udelay(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int host_up(void)
++{
++	uint32_t v;
++
++	/* clock gates are active-low: clear the bit to open the gate */
++	wr(sc.infra, INFRA2_CLR, (1u << 1) | (1u << 31));
++	wr(sc.infra, INFRA0_CLR, (1u << 8));
++	wr(sc.infra, INFRA1_CLR, (1u << 4) | (1u << 16));
++	udelay(1000);
++
++	/* power up the controller and take it out of host power-down */
++	wr(sc.ippc, IPPC_PW_CTRL1, rd(sc.ippc, IPPC_PW_CTRL1) & ~1u);
++	wr(sc.ippc, IPPC_PW_CTRL0, rd(sc.ippc, IPPC_PW_CTRL0) & ~1u);
++	udelay(2000);
++
++	/* USB2 PHY: bias on, UART mode off, no BC1.1 */
++	wr(sc.phy, PHY_PHYA_REG1 - U3PHY_BASE, rd(sc.phy, PHY_PHYA_REG1 - U3PHY_BASE) |
++	   RG_SSUSB_VUSB10_ON);
++	udelay(250);
++	v = rd(sc.phy, PHY_U2PHYDTM0 - U3PHY_BASE);
++	wr(sc.phy, PHY_U2PHYDTM0 - U3PHY_BASE,
++	   v & ~(RG_UART_MODE_MASK | FORCE_UART_EN | FORCE_SUSPENDM));
++	wr(sc.phy, PHY_U2PHYDTM1 - U3PHY_BASE,
++	   rd(sc.phy, PHY_U2PHYDTM1 - U3PHY_BASE) & ~RG_UART_EN);
++	v = rd(sc.phy, PHY_U2PHYACR4 - U3PHY_BASE);
++	wr(sc.phy, PHY_U2PHYACR4 - U3PHY_BASE,
++	   (v & ~(RG_USB20_GPIO_CTL | USB20_GPIO_MODE |
++		  RG_USB20_DM_100K_EN | USB20_DP_100K_EN)) |
++	   RG_USB20_DP_100K_MODE);
++	v = rd(sc.phy, PHY_USBPHYACR6 - U3PHY_BASE);
++	wr(sc.phy, PHY_USBPHYACR6 - U3PHY_BASE,
++	   v & ~(RG_USB20_BC11_SW_EN | RG_USB20_OTG_VBUSCMP_EN));
++	udelay(800);
++
++	/* the analogue VBUSVALID/SESSEND on this board are dead: force them */
++	wr(sc.phy, PHY_U2PHYDTM1 - U3PHY_BASE, 0x2614u);
++	udelay(500);
++
++	if (wait_bits(sc.op, XO_USBSTS, USBSTS_CNR, 0, 100000))
++		return ETIMEDOUT;
++	return 0;
++}
++
++static void ring_init(uint32_t *r, uint64_t pa, int *idx, int *cyc)
++{
++	int i;
++
++	bzero(r, RING_TRBS * 16);
++	for (i = 0; i < RING_TRBS - 1; i++) {
++		uint32_t *t = ring(r, i);
++		t[0] = 0; t[1] = 0; t[2] = 0; t[3] = 1u;	/* cycle 1 */
++	}
++	{
++		uint32_t *l = ring(r, RING_TRBS - 1);
++		l[0] = (uint32_t)pa;
++		l[1] = (uint32_t)(pa >> 32);
++		l[2] = 0;
++		l[3] = (6u << 10) | (1u << 1) | 1u;
++	}
++	*idx = 0;
++	*cyc = 1;
++}
++
++static int controller_init(void)
++{
++	if (host_up())
++		return -1;
++
++	wr(sc.op, XO_USBCMD, 0);
++	if (wait_bits(sc.op, XO_USBSTS, USBSTS_HALT, USBSTS_HALT, 100000))
++		return -1;
++	wr(sc.op, XO_USBCMD, USBCMD_HCRST);
++	if (wait_bits(sc.op, XO_USBCMD, USBCMD_HCRST, 0, 200000))
++		return -1;
++	if (wait_bits(sc.op, XO_USBSTS, USBSTS_CNR, 0, 200000))
++		return -1;
++
++	wr(sc.op, XO_PAGESIZE, 1);
++	wr(sc.op, XO_CONFIG, (rd(sc.op, XO_CONFIG) & ~0xffu) | 0x0fu);
++
++	ring_init(sc.cmd, sc.cmd_pa, &sc.cmd_i, &sc.cmd_c);
++	wr(sc.op, XO_CRCR, (uint32_t)sc.cmd_pa | 1u);
++	wr(sc.op, XO_CRCR + 4, (uint32_t)(sc.cmd_pa >> 32));
++	wr(sc.op, XO_DCBAAP, (uint32_t)sc.dcb_pa);
++	wr(sc.op, XO_DCBAAP + 4, (uint32_t)(sc.dcb_pa >> 32));
++	sc.dcb[0] = (uint32_t)sc.dctx_pa;
++	sc.dcb[1] = (uint32_t)(sc.dctx_pa >> 32);
++
++	/* one-entry event ring segment table */
++	{
++		uint32_t *erst = (uint32_t *)(sc.pool + 0x600);
++
++		erst[0] = (uint32_t)sc.evt_pa;
++		erst[1] = (uint32_t)(sc.evt_pa >> 32);
++		erst[2] = RING_TRBS;
++		erst[3] = 0;
++	}
++	bzero(sc.evt, RING_TRBS * 16);
++	for (int i = 0; i < RING_TRBS; i++)
++		ring(sc.evt, i)[3] = 1u;
++	wr(sc.op, XO_RT_BASE + RT_ERSTSZ, 1);
++	wr(sc.op, XO_RT_BASE + RT_ERSTBA + 4, 0);
++	wr(sc.op, XO_RT_BASE + RT_ERSTBA, (uint32_t)(sc.pool_pa + 0x600));
++	wr(sc.op, XO_RT_BASE + RT_ERDP + 4, 0);
++	wr(sc.op, XO_RT_BASE + RT_ERDP, (uint32_t)sc.evt_pa);
++
++	wr(sc.op, XO_USBCMD, USBCMD_RUN);
++	udelay(10000);
++	return 0;
++}
++
++/* ---- command / event rings ------------------------------------------- */
++static void push_trb(uint32_t *base, uint64_t pa, int *idx, int *cyc,
++		     uint32_t a, uint32_t b, uint32_t c, uint32_t d)
++{
++	uint32_t *t = ring(base, *idx);
++
++	t[0] = a; t[1] = b; t[2] = c;
++	t[3] = (d & ~1u) | (uint32_t)*cyc;
++	__asm__ volatile("dsb sy" ::: "memory");
++	(*idx)++;
++	if (*idx >= RING_TRBS - 1) {
++		uint32_t *l = ring(base, RING_TRBS - 1);
++		l[0] = (uint32_t)pa; l[1] = (uint32_t)(pa >> 32);
++		l[2] = 0; l[3] = (6u << 10) | (1u << 1) | (uint32_t)*cyc;
++		__asm__ volatile("dsb sy" ::: "memory");
++		*idx = 0;
++		*cyc ^= 1;
++	}
++}
++
++static int wait_event(uint32_t *code, uint32_t *lo, uint32_t *hi, uint32_t us)
++{
++	while (us--) {
++		uint32_t *e = ring(sc.evt, sc.evt_i);
++		uint32_t d3 = e[3];
++
++		if ((d3 & 1u) == 1u && (rd(sc.op, XO_USBSTS) & USBSTS_EINT || 1)) {
++			if (((d3 >> 10) & 0x3f) == 1) {	/* Transfer Event */
++				*code = e[2] >> 24;
++			} else if (((d3 >> 10) & 0x3f) == 0x3f ||
++				   ((d3 >> 10) & 0x3f) == 32) {
++				*code = 0;		/* handled below */
++			}
++			if (((d3 >> 10) & 0x3f) == 0x21 ||
++			    ((d3 >> 10) & 0x3f) == 0x20 ||
++			    ((d3 >> 10) & 0x3f) == 1 ||
++			    ((d3 >> 10) & 0x3f) == 6) {
++				*lo = e[2];
++				*hi = d3;
++				e[3] = 0;	/* consume */
++				__asm__ volatile("dsb sy" ::: "memory");
++				sc.evt_i = (sc.evt_i + 1) % RING_TRBS;
++				wr(sc.op, XO_RT_BASE + RT_ERDP, (uint32_t)sc.evt_pa +
++				   (uint32_t)(sc.evt_i * 16));
++				wr(sc.op, XO_RT_BASE + RT_ERDP + 4, 0);
++				return 1;
++			}
++		}
++		udelay(1);
++	}
++	return 0;
++}
++
++static int command(uint32_t a, uint32_t b, uint32_t c, uint32_t d,
++		   uint32_t *ccode)
++{
++	uint32_t code = 0xffff, lo = 0, hi = 0;
++
++	push_trb(sc.cmd, sc.cmd_pa, &sc.cmd_i, &sc.cmd_c, a, b, c, d);
++	wr(sc.op, XO_DB_BASE, 0);
++	if (!wait_event(&code, &lo, &hi, 200000))
++		return ETIMEDOUT;
++	*ccode = (hi >> 24) & 0xff;
++	return 0;
++}
++
++/* ---- ports / slots ---------------------------------------------------- */
++static int port_reset(void)
++{
++	uint32_t off = XO_PORTSC * 4u + sc.port * 16u;
++	static const uint32_t ports[] = { 0x420, 0x430, 0x440, 0x450 };
++	uint32_t i;
++
++	/* PORTSC block starts at op+0x400; probe each port for a device */
++	for (i = 0; i < 4; i++) {
++		uint32_t o = ports[i];
++		uint32_t ps = rd(sc.op, o);
++
++		wr(sc.op, o, (ps & ~(PORTSC_PP | PORTSC_PR)) | PORTSC_PP | PORTSC_CSC | PORTSC_PRC);
++		udelay(20000);
++		ps = rd(sc.op, o);
++		if (!(ps & PORTSC_CCS))
++			continue;
++		wr(sc.op, o, (ps & ~(PORTSC_PR | PORTSC_PRC | PORTSC_CSC)) | PORTSC_PR);
++		if (wait_bits(sc.op, o, PORTSC_PR, 0, 500000))
++			continue;
++		udelay(20000);
++		ps = rd(sc.op, o);
++		if (!(ps & PORTSC_PED))
++			continue;
++		sc.port = o;
++		(void)off;
++		return 0;
++	}
++	return ENODEV;
++}
++
++static void ep0_ctx(uint32_t entries, uint16_t mps)
++{
++	uint32_t *in = sc.ictx;
++
++	bzero(in, 6 * 32);
++	/* slot context: route 0, high-speed(3), last context index = entries */
++	in[0] = (3u << 20) | ((entries & 0x1fu) << 27);
++	in[1] = (1u << 16);
++	in[2] = 0;
++	in[3] = (1u << 22) | (1u << 23) | 0;
++	/* EP0 context at DCI 1 */
++	{
++		uint32_t *e = in + 2 * 8;	/* DCI 1 lives at entry 2 */
++
++		e[1] = ((uint32_t)mps << 16) | (3u) | (1u << 1);
++	}
++}
++
++static int enumerate(void)
++{
++	uint32_t cc, lo, hi;
++	uint8_t *d = sc.data;
++
++	if (!pool_alloc())
++		return ENOMEM;
++	if (port_reset())
++		return ENODEV;
++	if (controller_init())
++		return ENODEV;
++
++	if (command(0, 0, 0, (CMD_ENABLE_SLOT << 10), &cc) || cc != 1)
++		return ENODEV;
++	sc.slot = 1;
++	ep0_ctx(1, 64);
++	command((uint32_t)sc.ictx_pa, (uint32_t)(sc.ictx_pa >> 32), 0,
++		(CMD_ADDRESS_DEVICE << 10) | (sc.slot << 16), &cc);
++	if (cc != 1) {
++		printf("usbmsc: address device failed %u\n", cc);
++		return ENODEV;
++	}
++	(void)lo; (void)hi; (void)d;
++	return 0;
++}
++
++/* ---- block device ---------------------------------------------------- */
++static int usbmsc_strategy(struct buf *bp)
++{
++	uint32_t len = (uint32_t)buf_count(bp);
++
++	if (!sc.ready) {
++		buf_seterror(bp, ENXIO);
++		buf_biodone(bp);
++		return 0;
++	}
++	buf_setresid(bp, len);
++	if (!(buf_flags(bp) & B_READ) || (len & 511u)) {
++		buf_seterror(bp, EINVAL);
++		buf_biodone(bp);
++		return 0;
++	}
++	/* transport arrives in the next patch: BOT CBW/data/CSW per 4 KiB */
++	buf_seterror(bp, EIO);
++	buf_biodone(bp);
++	return 0;
++}
++
++static int usbmsc_open(dev_t dev, int flags, int fmt, struct proc *p) { return 0; }
++static int usbmsc_close(dev_t dev, int flags, int fmt, struct proc *p) { return 0; }
++static int usbmsc_psize(dev_t dev) { return (int)(sc.sectors / 2u); }
++
++static struct bdevsw usbmsc_bdevsw = {
++	.d_open = usbmsc_open,
++	.d_close = usbmsc_close,
++	.d_strategy = usbmsc_strategy,
++	.d_ioctl = (d_ioctl_t *)nulldev,
++	.d_dump = (d_dump_t *)nulldev,
++	.d_psize = usbmsc_psize,
++	.d_type = D_DISK
++};
++
++int rosemary_usbmsc_rootdev(dev_t *dev)
++{
++	PE_parse_boot_argn("usbmsc", &usbmsc_enable, sizeof(usbmsc_enable));
++	if (!usbmsc_enable)
++		return ENXIO;
++	if (sc.ready)
++		return EBUSY;
++
++	sc.op = ml_io_map(XHCI_BASE, 0x800);
++	sc.ippc = ml_io_map(IPPC_BASE, 0x100);
++	sc.phy = ml_io_map(U3PHY_BASE, 0x1000);
++	sc.infra = ml_io_map(INFRA_AO, 0x1000);
++	if (!sc.op || !sc.ippc || !sc.phy || !sc.infra)
++		return ENOMEM;
++
++	if (!pool_alloc())
++		return ENOMEM;
++	sc.cmd = (uint32_t *)sc.pool;
++	sc.cmd_pa = sc.pool_pa;
++	sc.evt = (uint32_t *)(sc.pool + 0x400);
++	sc.evt_pa = sc.pool_pa + 0x400;
++	sc.dcb = (uint32_t *)(sc.pool + OFF_DCBC);
++	sc.dcb_pa = sc.pool_pa + OFF_DCBC;
++	sc.ictx = (uint32_t *)(sc.pool + OFF_ICTX);
++	sc.ictx_pa = sc.pool_pa + OFF_ICTX;
++	sc.dctx = (uint32_t *)(sc.pool + OFF_DCTX);
++	sc.dctx_pa = sc.pool_pa + OFF_DCTX;
++	sc.bin = (uint32_t *)(sc.pool + OFF_BIN);
++	sc.bin_pa = sc.pool_pa + OFF_BIN;
++	sc.bout = (uint32_t *)(sc.pool + OFF_BOUT);
++	sc.bout_pa = sc.pool_pa + OFF_BOUT;
++	sc.data = (uint8_t *)(sc.pool + OFF_DATA);
++	sc.data_pa = sc.pool_pa + OFF_DATA;
++
++	if (enumerate())
++		return ENODEV;
++
++	sc.bmajor = bdevsw_add(-1, &usbmsc_bdevsw);
++	if (sc.bmajor < 0)
++		return ENODEV;
++	sc.bdev = makedev(sc.bmajor, 0);
++	sc.ready = true;
++	*dev = sc.bdev;
++	printf("usbmsc: usbroot0 registered (transport pending)\n");
++	return 0;
++}
