@@ -19,7 +19,7 @@
 #include <sys/uio.h>
 #include <miscfs/devfs/devfs.h>
 #include <machine/machine_routines.h>
-#include <osfmk/arm/caches_internal.h>
+#include <arm/caches_internal.h>
 #include <vm/pmap.h>
 #include <vm/vm_kern.h>
 #include <pexpert/pexpert.h>
@@ -128,22 +128,17 @@ static inline uint32_t *ring(uint32_t *base, int i) { return base + i * 4; }
 /* ---- DMA pool -------------------------------------------------------- */
 static bool pool_alloc(void)
 {
-	uint32_t pages = POOL_SIZE / PAGE_SIZE;
-	ppnum_t first;
-	uint32_t i;
+	ppnum_t pn;
 
-	sc.pool = kmem_alloc_contig(kernel_map, POOL_SIZE, 0, 0xFFFFFFFFull,
-				    PAGE_SIZE, 0, VM_PROT_READ | VM_PROT_WRITE);
-	if (!sc.pool)
+	if (sc.pool)
+		return true;
+	if (kmem_alloc_contig(kernel_map, &sc.pool, POOL_SIZE, PAGE_MASK, 0, 0,
+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
 		return false;
-	first = pmap_find_phys(kernel_pmap, (addr64_t)sc.pool);
-	if (!first)
+	pn = pmap_find_phys(kernel_pmap, (addr64_t)sc.pool);
+	if (!pn)
 		return false;
-	for (i = 1; i < pages; i++)
-		if (pmap_find_phys(kernel_pmap, (addr64_t)(sc.pool + i * PAGE_SIZE)) != first + i)
-			return false;	/* must be physically contiguous for DMA */
-	sc.pool_pa = (uint64_t)ptoa_64(first);
-	bzero((void *)sc.pool, POOL_SIZE);
+	sc.pool_pa = ptoa_64(pn);
 	return true;
 }
 
