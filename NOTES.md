@@ -1,4 +1,16 @@
-# CURRENT HANDOFF — native driver port started, transport NOT implemented
+# CURRENT HANDOFF — native USB transport implemented; local ARM64 object passes
+
+Read USB-NATIVE-STATUS.md first. 0093 + additions now implement xHCI/EP0/BOT/READ10 and read-only block device (no transport stubs). Local isolated Clang14 compile with actual CI headers/flags passes syntax and ARM64 Mach-O object generation; dependencies all exist in user's kernel(11). Patch apply check passes; DMA interval/ring wrap models pass. Full Xcode16 CI and kernel hardware validation still pending. USB2 HS BOT/LUN0/superfloppy512 only; no writes/hubs/UAS/GPT/recovery. Do not claim iOS boots. User next uploads patch + source + workflow for full CI, no flashing yet; test boot_a only, preserve boot_b. No .git, no commit. Native status file documents limits/tools/results.
+
+# HISTORICAL HANDOFF — USB entry point verified in linked kernel
+
+Inspected work/shim-boot-данные/xnu-kernel (11).zip. usbmsc-nm.log empty (nm succeeded); usbmsc-symbols.txt contains fffffe00074eb930 S _rosemary_usbmsc_rootdev. Independent Mach-O parser confirms defined N_SECT symbol (type 0x0f), section14 __TEXT_EXEC,__text. SHA256 kernel.development.rosemary = 28b75255b26aedba6e99fcd58a2d39b7fd6fe1e018c0a22a1e3a06612a94e420. Failure definitively caused by old CI T/t-only filter rejecting S classification; updated nm -m section-backed check already in workflow. No rebuild needed merely to establish integration. Native driver remains functionally incomplete; no EP0/BOT, strategy EIO, do not flash/test as USB root. Next work is real transport implementation, not further scaffold builds.
+
+# HISTORICAL HANDOFF — compile succeeds; kernel symbol verification fails
+
+Latest user screenshot: Build succeeds, source cmp/build entry/root hook checks succeed; Verify USB root integration fails with missing symbol. Cause NOT established (possible nm classification, unavailable candidate, actual omission). Updated workflow to nm -arch arm64 -m and require section-backed defined _rosemary_usbmsc_rootdev, not traditional T/t code; logs each candidate/file type/errors and keeps per-kernel symbol logs. Need existing failed run xnu-kernel artifact with usbmsc-symbols.txt/usbmsc-nm.log or link to run before claiming cause. No new hardware test; native driver remains incomplete (strategy EIO, no EP0/BOT), compilation success is not functionality. Source compile fixes include kern/clock.h + delay(), correct out-param kmem_alloc_contig, missing d_dump_t cast removed (d_dump field DOES exist; prior explanation was wrong). No .git metadata, no commit possible.
+
+# HISTORICAL HANDOFF — native driver port started, transport NOT implemented
 
 0093 now applies cleanly to the extracted CI tree (verified with git apply --check in work/xnu-ci-42397771053). Driver rewritten as a real port: DMA pool via kmem_alloc_contig + explicit physical-contiguity check (pmap_find_phys chain), PHY/IPPC/INFRA power-up, HCRST, PAGESIZE, CONFIG, CRCR 0x18, DCBAAP 0x30 with DCBAA[0], one-entry ERST, event ring with cycle-1 TRBs, port scan and reset, Enable Slot, EP0 input context, Address Device, bdevsw registration as usbroot0.
 

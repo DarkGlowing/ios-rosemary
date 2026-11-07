@@ -114,16 +114,28 @@ jobs:
           grep -F 'rosemary_usbmsc_rootdev(root)' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp
           mkdir -p out
           found=0
+          candidates=0
           for kernel in dxb/fakeroot/System/Library/Kernels/kernel.*; do
             [ -f "$kernel" ] || continue
-            if xcrun nm "$kernel" > out/usbmsc-symbols.txt 2> out/usbmsc-nm.log; then
-              if grep -E '[[:space:]][Tt][[:space:]]_rosemary_usbmsc_rootdev$' out/usbmsc-symbols.txt; then
+            candidates=$((candidates + 1))
+            name=$(basename "$kernel")
+            echo "Inspecting $kernel"
+            file "$kernel"
+            if xcrun nm -arch arm64 -m "$kernel" > "out/$name.usbmsc-symbols.txt" 2> "out/$name.usbmsc-nm.log"; then
+              # Mach-O kernel text need not map to nm's traditional T code.
+              # Require a defined section-backed symbol, never an undefined U.
+              if grep -E '\([^)]*,[^)]*\).* _rosemary_usbmsc_rootdev$' "out/$name.usbmsc-symbols.txt"; then
                 found=1
-                break
+              else
+                echo 'No defined USB root entry point; related symbols:'
+                grep -E 'rosemary_(usb|ufs)|IOFindBSDRoot' "out/$name.usbmsc-symbols.txt" || true
               fi
+            else
+              cat "out/$name.usbmsc-nm.log"
             fi
           done
-          [ "$found" -eq 1 ] || { echo 'USB root symbol missing: integration unverified'; exit 1; }
+          echo "Kernel candidates: $candidates; USB symbol verified: $found"
+          [ "$found" -eq 1 ] || { echo 'USB root integration unverified; inspect uploaded *.usbmsc-* logs'; exit 1; }
 
       - name: Package build tree for local compiles
         if: always()
