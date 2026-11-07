@@ -18,6 +18,7 @@
 #include <sys/errno.h>
 #include <sys/uio.h>
 #include <miscfs/devfs/devfs.h>
+#include <kern/clock.h>
 #include <machine/machine_routines.h>
 #include <arm/caches_internal.h>
 #include <vm/pmap.h>
@@ -121,7 +122,7 @@ static int usbmsc_enable = 1;
 
 static inline uint32_t rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
 static inline void wr(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
-static void udelay(uint32_t us) { delay_for_interval(us, 1000); }
+static void udelay(uint32_t us) { delay((int)us); }
 
 static inline uint32_t *ring(uint32_t *base, int i) { return base + i * 4; }
 
@@ -427,16 +428,17 @@ static int usbmsc_strategy(struct buf *bp)
 	return 0;
 }
 
-static int usbmsc_open(dev_t dev, int flags, int fmt, struct proc *p) { return 0; }
-static int usbmsc_close(dev_t dev, int flags, int fmt, struct proc *p) { return 0; }
-static int usbmsc_psize(dev_t dev) { return (int)(sc.sectors / 2u); }
+int rosemary_usbmsc_rootdev(dev_t *dev);
+
+static int usbmsc_open(dev_t dev, int flags, int fmt, struct proc *p) { (void)dev; (void)flags; (void)fmt; (void)p; return 0; }
+static int usbmsc_close(dev_t dev, int flags, int fmt, struct proc *p) { (void)dev; (void)flags; (void)fmt; (void)p; return 0; }
+static int usbmsc_psize(dev_t dev) { (void)dev; return (int)(sc.sectors / 2u); }
 
 static struct bdevsw usbmsc_bdevsw = {
 	.d_open = usbmsc_open,
 	.d_close = usbmsc_close,
 	.d_strategy = usbmsc_strategy,
 	.d_ioctl = (d_ioctl_t *)nulldev,
-	.d_dump = (d_dump_t *)nulldev,
 	.d_psize = usbmsc_psize,
 	.d_type = D_DISK
 };
