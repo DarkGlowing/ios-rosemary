@@ -1,4 +1,8 @@
-# CURRENT HANDOFF — native USB transport implemented; local ARM64 object passes
+# CURRENT HANDOFF — Xcode BSD missing private declarations fixed
+
+Latest user CI excerpt reports exactly 2 errors: undeclared ml_io_map and pmap_find_phys. Added explicit prototypes matching existing rosemary_ufs.c; removed impossible uint16 length >65536 comparison. Regenerated 0093; git apply --check passes. Local ARM64 object generation with -Werror=implicit-function-declaration succeeds, work/usbmsc-object-build.log. Hardened work/check-usbmsc.py to make implicit declarations fatal; local helper had stripped original Werror flags and uses older exported headers, so previous local success did not guarantee Xcode build. Need user upload source + 0093 and rerun CI. No hardware claims; native transport remains untested on device.
+
+# HISTORICAL HANDOFF — native USB transport implemented; local ARM64 object passes
 
 Read USB-NATIVE-STATUS.md first. 0093 + additions now implement xHCI/EP0/BOT/READ10 and read-only block device (no transport stubs). Local isolated Clang14 compile with actual CI headers/flags passes syntax and ARM64 Mach-O object generation; dependencies all exist in user's kernel(11). Patch apply check passes; DMA interval/ring wrap models pass. Full Xcode16 CI and kernel hardware validation still pending. USB2 HS BOT/LUN0/superfloppy512 only; no writes/hubs/UAS/GPT/recovery. Do not claim iOS boots. User next uploads patch + source + workflow for full CI, no flashing yet; test boot_a only, preserve boot_b. No .git, no commit. Native status file documents limits/tools/results.
 

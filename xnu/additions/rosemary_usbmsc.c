@@ -18,6 +18,10 @@
 #include <libkern/libkern.h>
 
 #if defined(ARM64_BOARD_CONFIG_ROSEMARY)
+/* Private ARM APIs are not declared by the BSD exported headers.
+ * Same declarations as the existing rosemary_ufs driver. */
+extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define NT 32u
 #define POOL_SIZE 0x100000u
 #define CMD 0x0000u
@@ -346,7 +350,6 @@ static int control(uint8_t reqtype,uint8_t req,uint16_t value,uint16_t index,uin
  uint32_t e[4];
  uint64_t setup=(uint64_t)reqtype|((uint64_t)req<<8)|((uint64_t)value<<16)|
                 ((uint64_t)index<<32)|((uint64_t)length<<48);
- if(length>DATA_SIZE)return EINVAL;
  if(length){bzero(mem(DATA),length);sync_dma(DATA,length);}
  push(&sc.ep0,setup,8,(2u<<10)|(1u<<6)|(length?(3u<<16):0));
  if(length)push(&sc.ep0,phys(DATA),length,(3u<<10)|(1u<<16)|(1u<<2));
