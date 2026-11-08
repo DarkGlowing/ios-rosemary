@@ -1,13 +1,14 @@
 diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
-index eeb5e3d..6521be6 100644
+index eeb5e3d..64464ca 100644
 --- a/osfmk/console/serial_console.c
 +++ b/osfmk/console/serial_console.c
-@@ -242,12 +242,33 @@ get_cons_ops_index(void)
+@@ -242,12 +242,35 @@ get_cons_ops_index(void)
   * @param poll Whether or not this call should poll instead of going to sleep
   *             waiting for an interrupt when the hardware device isn't ready
   */
 +#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
 +extern void rosemary_log_append(const char *c, int size);  /* bsd/dev/rosemary_ufs.c */
++extern void rosemary_wdt_pet(void);                       /* bsd/dev/rosemary_ufs.c */
 +/*
 + * Set by AppleCLCD (boot-arg rosemaryfb_noconsole=1) once the GUI presents:
 + * console text still goes to the persistent log, but is not drawn over
@@ -31,12 +32,13 @@ index eeb5e3d..6521be6 100644
 +	 * first 4 KiB of a boot instead of the last lines before the reset).
 +	 */
 +	rosemary_log_append(&c, 1);
++	rosemary_wdt_pet();
 +#endif
 +
  	poll = poll || in_debugger;
  
  	if (c == '\n') {
-@@ -266,23 +287,12 @@ _cnputc(char c, bool poll)
+@@ -266,23 +289,12 @@ _cnputc(char c, bool poll)
   *             waiting for an interrupt when the hardware device isn't ready
   * @param size The number of characters to print to the console.
   */

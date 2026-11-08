@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/rosemary_ufs.c b/bsd/dev/rosemary_ufs.c
-index 62889e1..bbd2550 100644
+index 62889e1..4f23992 100644
 --- a/bsd/dev/rosemary_ufs.c
 +++ b/bsd/dev/rosemary_ufs.c
 @@ -681,6 +681,13 @@ rosemary_ufs_init(void)
@@ -25,7 +25,7 @@ index 62889e1..bbd2550 100644
  		return;
  	}
  	uint64_t at = os_atomic_add_orig(&rosemary_log_total, (uint64_t)size, relaxed);
-@@ -788,4 +795,38 @@ rosemary_ufs_rootdev(dev_t *dev)
+@@ -788,4 +795,87 @@ rosemary_ufs_rootdev(dev_t *dev)
  	*dev = su.bdev;
  	return 0;
  }
@@ -61,6 +61,55 @@ index 62889e1..bbd2550 100644
 +	}
 +	*pos += n;
 +	return n;
++}
++
++/*
++ * MTK top RGU watchdog (shim/platform_mt6785.h).
++ *
++ * The boot ends in a reset 25-30 s after the jump with no panic on the
++ * console, and the shim's wdt_disable() only clears the EN bit of one
++ * instance. The watchdog is therefore petted from the console path, which is
++ * where every printed line already arrives: while the boot (or the log pager)
++ * prints, the timer is fed. rosemary_wdt_map() is called once from
++ * pe_init_iokit(), after the VM can map MMIO; before that the pet is a no-op.
++ */
++#define ROSEMARY_WDT_PA         0x10007000UL
++#define ROSEMARY_WDT_MODE       0x00
++#define ROSEMARY_WDT_LENGTH     0x04
++#define ROSEMARY_WDT_RESTART    0x08
++#define ROSEMARY_WDT_KEY        0x1971u
++
++static vm_offset_t rosemary_wdt;
++static int rosemary_wdt_logged;
++
++void rosemary_wdt_map(void);
++void rosemary_wdt_pet(void);
++
++void
++rosemary_wdt_map(void)
++{
++	if (rosemary_wdt == 0) {
++		rosemary_wdt = ml_io_map(ROSEMARY_WDT_PA, 0x1000);
++	}
++	if (rosemary_wdt == 0) {
++		printf("ROSEMARY WDT: map failed, not petting\n");
++		return;
++	}
++	if (!rosemary_wdt_logged) {
++		rosemary_wdt_logged = 1;
++		printf("ROSEMARY WDT: mode=0x%x length=0x%x, petted from the console path\n",
++		    *(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_MODE),
++		    *(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_LENGTH));
++	}
++}
++
++void
++rosemary_wdt_pet(void)
++{
++	if (rosemary_wdt != 0) {
++		*(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_RESTART) =
++		    (ROSEMARY_WDT_KEY << 16) | 0x19;
++	}
 +}
 +
  #endif /* ARM64_BOARD_CONFIG_ROSEMARY */

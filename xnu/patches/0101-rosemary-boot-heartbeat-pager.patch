@@ -12,10 +12,10 @@ index 9b6ccdb..6340d27 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/rosemary_beat.c b/bsd/dev/rosemary_beat.c
 new file mode 100644
-index 0000000..8f69e31
+index 0000000..7a96b23
 --- /dev/null
 +++ b/bsd/dev/rosemary_beat.c
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,202 @@
 +/*
 + * ROSEMARY boot heartbeat and boot-log pager.
 + *
@@ -52,7 +52,6 @@ index 0000000..8f69e31
 +
 +/* Not exported to the BSD layer by the headers above. */
 +extern int hz;
-+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +extern void thread_deallocate(thread_t);
 +
@@ -65,41 +64,6 @@ index 0000000..8f69e31
 +/* bsd/dev/rosemary_ufs.c: set while a page is printed, so the pager does not
 + * record its own output into the ring it is reading from. */
 +extern int rosemary_log_pause;
-+
-+/*
-+ * MTK top RGU watchdog (shim/platform_mt6785.h). The shim clears its EN bit
-+ * before the jump, but the boot still ends in a reset about 25-30 s into XNU
-+ * with no panic on the console, which is what an armed watchdog looks like:
-+ * either another instance or LK re-arming this one. Petting it from the beat
-+ * thread takes that timer out of the experiment; the mode/length registers are
-+ * printed once so the log says what was actually armed.
-+ */
-+#define ROSEMARY_WDT_PA        0x10007000UL
-+#define ROSEMARY_WDT_SIZE      0x1000
-+#define ROSEMARY_WDT_MODE      0x00
-+#define ROSEMARY_WDT_LENGTH    0x04
-+#define ROSEMARY_WDT_RESTART   0x08
-+#define ROSEMARY_WDT_KEY       0x1971u
-+
-+/* Same style as bsd/dev/rosemary_ufs.c: a mapped address kept as an integer,
-+ * each register touched through an explicit cast. */
-+static vm_offset_t rosemary_wdt;
-+
-+static void
-+rosemary_wdt_pet(void)
-+{
-+	if (rosemary_wdt != 0) {
-+		*(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_RESTART) =
-+		    (ROSEMARY_WDT_KEY << 16) | 0x19;
-+		__asm__ volatile("dsb sy" ::: "memory");
-+	}
-+}
-+
-+static uint32_t
-+rosemary_wdt_rd(uint32_t off)
-+{
-+	return rosemary_wdt != 0 ? *(volatile uint32_t *)(rosemary_wdt + off) : 0;
-+}
 +
 +void rosemary_beat_start(void);
 +
@@ -194,7 +158,6 @@ index 0000000..8f69e31
 +		(void)tsleep(&rosemary_beat_chan, PZERO, "rosemarybt",
 +		    hz * (int)rosemary_beat_secs);
 +		rosemary_beat_count++;
-+		rosemary_wdt_pet();
 +
 +		/*
 +		 * Never interleave with the boot's own output: writing a dot from
@@ -248,25 +211,6 @@ index 0000000..8f69e31
 +	/* Paging must be visible even when AppleCLCD muted the console for the GUI. */
 +	rosemary_console_muted = 0;
 +
-+	{
-+		int pet = 1;
-+		(void)PE_parse_boot_argn("rosemarywdt", &pet, sizeof(pet));
-+		if (pet) {
-+			rosemary_wdt = ml_io_map(ROSEMARY_WDT_PA, ROSEMARY_WDT_SIZE);
-+			if (rosemary_wdt != 0) {
-+				printf("ROSEMARY WDT: mode=0x%x length=0x%x, petting every %us\n",
-+				    rosemary_wdt_rd(ROSEMARY_WDT_MODE),
-+				    rosemary_wdt_rd(ROSEMARY_WDT_LENGTH),
-+				    rosemary_beat_secs);
-+				rosemary_wdt_pet();
-+			} else {
-+				printf("ROSEMARY WDT: map failed, not petting\n");
-+			}
-+		} else {
-+			printf("ROSEMARY WDT: petting disabled by boot-arg\n");
-+		}
-+	}
-+
 +	if (kernel_thread_start(rosemary_beat_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	} else {
@@ -275,10 +219,10 @@ index 0000000..8f69e31
 +}
 +#endif /* ARM64_BOARD_CONFIG_ROSEMARY */
 diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
-index 04dda53..717589a 100644
+index 04dda53..d39e089 100644
 --- a/pexpert/arm/pe_init.c
 +++ b/pexpert/arm/pe_init.c
-@@ -379,6 +379,17 @@ PE_lockdown_iokit(void)
+@@ -379,6 +379,19 @@ PE_lockdown_iokit(void)
  	 * hardware protections.
  	 */
  	zalloc_iokit_lockdown();
@@ -291,6 +235,8 @@ index 04dda53..717589a 100644
 +	 * without a serial port. bsd/dev/rosemary_beat.c
 +	 */
 +	extern void rosemary_beat_start(void);
++	extern void rosemary_wdt_map(void);
++	rosemary_wdt_map();
 +	rosemary_beat_start();
 +#endif
  	StartIOKitMatching();
