@@ -103,21 +103,30 @@ jobs:
         # contains the old code while the sources say otherwise. Deleting just
         # those objects forces a real compile (and a real failure) for them,
         # without paying for a full rebuild of everything.
+        #
+        # The file list comes from the patch headers, not from `git apply
+        # --numstat`: this step runs before build.sh clones/applies anything,
+        # so there is no xnu tree to apply the patches to yet - the first
+        # version of this step asked git to apply them against *this* repo,
+        # failed silently and dropped nothing at all.
         run: |
           set -eu
-          files=$(for p in xnu/patches/*.patch; do
-                    git apply --numstat "$p" 2>/dev/null | awk '{print $3}'
-                  done | sort -u)
+          files=$(grep -hE '^\+\+\+ b/' xnu/patches/*.patch \
+                  | sed 's|^+++ b/||' | grep -v '^/dev/null$' | sort -u)
+          echo "patched sources: $(echo "$files" | wc -l)"
           n=0
           for f in $files; do
-            case "$f" in *.c|*.cpp|*.h) ;; *) continue ;; esac
-            base=$(basename "$f")
-            obj="${base%.*}.o"
+            case "$f" in *.c|*.cpp) ;; *) continue ;; esac
+            obj="$(basename "$f")"; obj="${obj%.*}.o"
             while IFS= read -r o; do
               rm -f "$o" && n=$((n + 1))
             done < <(find dxb/build -name "$obj" 2>/dev/null || true)
           done
-          echo "dropped $n cached objects for patched sources"
+          # The linked kernel itself may sit in the cached build tree; if a
+          # link fails under -k the Collect step would copy that stale binary.
+          k=$(find dxb/build -type f -name 'kernel.*' 2>/dev/null | wc -l)
+          find dxb/build -type f -name 'kernel.*' -delete 2>/dev/null || true
+          echo "dropped $n cached objects and $k cached kernel binaries"
 
       - name: Force full rebuild (defeat stale objects)
         # Full rebuild is opt-in: set the full_rebuild input when a stale
@@ -237,6 +246,7 @@ jobs:
           grep -c 'rosemary_beat_start' dxb/xnu/pexpert/arm/pe_init.c 2>&1 || true
           grep -c 'rosemary_bootlog_copy' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
           grep -c 'rosemary_log_append(&c, 1)' dxb/xnu/osfmk/console/serial_console.c 2>&1 || true
+          grep -c 'ROSEMARY WDT: mode=' dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || true
           ls -l dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || echo "rosemary_beat.c MISSING (0101 skipped)"
           grep -n 'rosemary_beat.c' dxb/xnu/bsd/conf/files 2>&1 || echo "conf/files entry MISSING"
           echo "=== compile errors that could explain a stale object (-k keeps going) ==="
@@ -250,6 +260,13 @@ jobs:
             echo "FAIL: a file our patches own did not compile, so the kernel was linked with a cached object and does not contain the new code."
             exit 1
           fi
+          echo "=== link failures (a stale kernel binary can survive these) ==="
+          grep -nE 'Undefined symbols|duplicate symbol|ld: |clang: error' dxb/build.log 2>/dev/null | head -20 || true
+          echo "=== kernels present after the build (a stale one from the cache would be old) ==="
+          find dxb -type f -name 'kernel.development.rosemary' -exec ls -l {} \; 2>/dev/null || true
+          find dxb -type f -name 'kernel.development.rosemary' -exec shasum -a 256 {} \; 2>/dev/null || true
+          echo "=== last 40 lines of the build log ==="
+          tail -40 dxb/build.log 2>/dev/null || true
 
       - name: Verify the patched source really has the diag
         if: always()
@@ -382,6 +399,16 @@ jobs:
           strings out/kernel.development.rosemary | grep -F 'ROSEMARY WDT: mode=' >/dev/null || {
             echo 'ERROR: watchdog petting patch 0101 missing from kernel'; exit 1; }
           (cd out && shasum -a 256 kernel.development.rosemary > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: buildlog
+          path: |
+            dxb/build.log
+            dxb/xnu/bsd/dev/rosemary_beat.c
+          if-no-files-found: warn
+          retention-days: 3
 
       - uses: actions/upload-artifact@v4
         if: always()
