@@ -1876,3 +1876,41 @@ esr=0 far=0 elr=0 spsr=0
   `lockdown phase start|done` / `machine_lockdown start|done` /
   `calling bsd_init`. Так видно ровно то, что нужно: `screen acquired` без
   следующей строки = встали в `initialize_screen()`.
+
+### 7.42.3 Маркеры дошли до `machine_lockdown done` (k27, 2026-11-08)
+
+С исправленным 0104 на экран вышла вся цепочка:
+
+```
+ROSEMARY PHASE: early_boot
+ROSEMARY BOOT: interrupts enabled
+ROSEMARY BOOT: acquiring screen
+ROSEMARY BOOT: screen acquired
+ROSEMARY BOOT: commpage init start
+ROSEMARY BOOT: commpage init done
+ROSEMARY BOOT: lockdown phase start
+ROSEMARY BOOT: lockdown phase done
+ROSEMARY BOOT: machine_lockdown start
+ROSEMARY BOOT: machine_lockdown done
+```
+
+и **нет** `calling bsd_init`. Значит `initialize_screen()`, `vm_commpage_init()`,
+`vm_commpage_text_init()`, `machine_lockdown()` проходят, а поток встаёт на
+одном из двух последних вызовов перед `bsd_init`:
+
+1. `PE_lockdown_iokit()` — внутри него `StartIOKitMatching()` (его строки
+   `enter`/`returned` видны, все драйверы `started 1` — то есть функция
+   возвращается);
+2. `vm_set_restrictions(machine_info.max_cpus)`;
+3. `kperf_init_early()` — на не-Apple SoC это PMU и его прерывание; типичное
+   место тихого зависания, и именно оно стоит последним.
+
+0104 теперь печатает `PE_lockdown_iokit start|done`,
+`vm_set_restrictions start|done`, `kperf_init_early start|done` и умеет
+`rosemarynokperf=1` — пропустить kperf целиком.
+
+Замечание по чтению лога: кольцо консоли — циклический буфер с резервированием
+места, поэтому при одновременной записи с нескольких CPU порядок строк на
+экране не хронологический. `machine_lockdown done` может стоять выше блока
+`MATCH`, хотя произошёл позже. Ориентироваться нужно на *наличие* маркера, а не
+на его позицию.

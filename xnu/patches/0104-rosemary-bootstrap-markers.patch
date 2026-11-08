@@ -1,5 +1,5 @@
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
-index bec97fb..162bc39 100644
+index bec97fb..7fcb43f 100644
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
 @@ -376,6 +376,29 @@ kernel_startup_log(startup_subsystem_id_t subsystem)
@@ -88,7 +88,49 @@ index bec97fb..162bc39 100644
  
  #ifdef CONFIG_XNUPOST
  	kern_return_t result = kernel_list_tests();
-@@ -787,7 +825,9 @@ kernel_bootstrap_thread(void)
+@@ -770,24 +808,49 @@ kernel_bootstrap_thread(void)
+ 
+ #ifdef  IOKIT
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
++	ROSEMARY_BOOT_MARK("PE_lockdown_iokit start");
+ 	PE_lockdown_iokit();
++	ROSEMARY_BOOT_MARK("PE_lockdown_iokit done");
+ #endif
+ 	/*
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+ 	 * at the latest
+ 	 */
++	ROSEMARY_BOOT_MARK("vm_set_restrictions start");
+ 	vm_set_restrictions(machine_info.max_cpus);
+-
++	ROSEMARY_BOOT_MARK("vm_set_restrictions done");
+ 
+ #if KPERF
+-	kperf_init_early();
++	/*
++	 * kperf_init_early() programs the PMU and asks for its interrupt. On a
++	 * non-Apple SoC that path is the last thing between here and bsd_init, and
++	 * rosemary never printed "calling bsd_init": rosemarynokperf=1 skips it so
++	 * one boot decides whether it is the culprit.
++	 */
++	{
++		static int rosemary_nokperf = -1;
++		if (rosemary_nokperf < 0) {
++			rosemary_nokperf = 0;
++			(void)PE_parse_boot_argn("rosemarynokperf", &rosemary_nokperf,
++			    sizeof(rosemary_nokperf));
++		}
++		if (rosemary_nokperf) {
++			ROSEMARY_BOOT_MARK("kperf_init_early skipped");
++		} else {
++			ROSEMARY_BOOT_MARK("kperf_init_early start");
++			kperf_init_early();
++			ROSEMARY_BOOT_MARK("kperf_init_early done");
++		}
++	}
+ #endif
+ 
+ 	/*
  	 *	Start the user bootstrap.
  	 */
  #ifdef  MACH_BSD
