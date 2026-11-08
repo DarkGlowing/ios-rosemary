@@ -1,0 +1,15 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -831,6 +831,11 @@
+ 	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_stride = *val;
+ 	}
++	/* ROSEMARY scanout has 1088 pixels per line, including padding. */
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++	if (fbcon_width == 1080 && fbcon_height == 2400)
++		fbcon_stride = 4352;
++#endif
+ 	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
+ 		return;
+ 	}

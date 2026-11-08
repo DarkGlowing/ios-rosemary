@@ -38,7 +38,7 @@ diff --git a/bsd/dev/rosemary_usbmsc.c b/bsd/dev/rosemary_usbmsc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/rosemary_usbmsc.c
-@@ -0,0 +1,556 @@
+@@ -0,0 +1,566 @@
 +/* MT6785 USB BOT root, polled and read-only. No USB hubs/UAS/hotplug.
 + * Hardware sequence derived from shim/usb.c; native XNU port needs HW testing.
 + * DMA addresses are physical 64-bit addresses, never kernel virtual pointers.
@@ -259,6 +259,7 @@ new file mode 100644
 +
 +
 +static int power_up(void) {
++ printf("usbmsc: vbus start\n");
 + uint8_t c11=0,c1d=0,check=0;
 + bb_pins_init();
 + if(bb_rd8(0x34,0x11,&c11)||bb_rd8(0x34,0x1d,&c1d))return EIO;
@@ -277,6 +278,7 @@ new file mode 100644
 + wr(sc.phy,0x320,(rd(sc.phy,0x320)&~((1u<<9)|(1u<<8)|(1u<<16)|(1u<<17)))|(1u<<18));
 + wr(sc.phy,0x318,rd(sc.phy,0x318)&~((1u<<23)|(1u<<20)));udelay(800);
 + wr(sc.phy,0x36c,0x2614);wr(sc.ippc,0x50,4);udelay(20000);
++ printf("usbmsc: vbus done\n");
 + return 0;
 +}
 +static void init_ring(struct usb_ring *r,uint32_t off) {
@@ -332,7 +334,9 @@ new file mode 100644
 + return err;
 +}
 +static int start_controller(void) {
++ printf("usbmsc: power start\n");
 + int err=power_up();if(err)return err;
++ printf("usbmsc: power done\n");
 + uint32_t cap=rd(sc.usb,0),hcs=rd(sc.usb,4),hcc=rd(sc.usb,0x10);
 + uint32_t caplen=cap&255,ports=hcs>>24;
 + if(caplen!=0x20 || !ports || (hcc&4))return ENOTSUP;
@@ -400,7 +404,9 @@ new file mode 100644
 + return err;
 +}
 +static int enumerate(void) {
++ printf("usbmsc: enumerate start\n");
 + int err=start_controller();if(err)return err;
++ printf("usbmsc: controller ready\n");
 + if((err=command(9,0,0,&sc.slot)))return err;
 + if(!sc.slot||sc.slot>sc.maxslots)return EIO;
 + ((uint64_t *)mem(DCBAA))[sc.slot]=phys(OUTPUT);clean(DCBAA,4096);
@@ -565,18 +571,22 @@ new file mode 100644
 + .d_strategy=usbmsc_strategy,.d_ioctl=usbmsc_ioctl,.d_psize=usbmsc_psize,.d_type=D_DISK};
 +int rosemary_usbmsc_rootdev(dev_t *dev) {
 + int enabled=1,err;PE_parse_boot_argn("usbmsc",&enabled,sizeof(enabled));
++ printf("usbmsc: root entry enabled=%d\n",enabled);
 + if(!enabled)return ENXIO;
 + lck_mtx_lock(&usbmsc_lock);
++ printf("usbmsc: root lock acquired\n");
 + if(sc.ready){*dev=sc.dev;lck_mtx_unlock(&usbmsc_lock);return 0;}
 + if(sc.pool){err=ENXIO;goto out;}
 + sc.usb=ml_io_map(0x11200000,0x4000);sc.ippc=sc.usb?sc.usb+0x3e00:0;
 + sc.phy=ml_io_map(0x11e40000,0x1000);sc.infra=ml_io_map(0x10001000,0x1000);
 + sc.gpio=ml_io_map(0x10005000,0x1000);
 + if(!sc.usb||!sc.ippc||!sc.phy||!sc.infra||!sc.gpio){err=ENOMEM;goto out;}
++ printf("usbmsc: mmio mapped\n");
 + if(kmem_alloc_contig(kernel_map,&sc.pool,POOL_SIZE,0xffff,0,0,
 +    KMA_DATA|KMA_ZERO|KMA_PERMANENT,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS){err=ENOMEM;goto out;}
 + ppnum_t pn=pmap_find_phys(kernel_pmap,(addr64_t)sc.pool);
 + sc.pa=ptoa_64(pn);
++ printf("usbmsc: dma allocated va=%llx pa=%llx\n",(unsigned long long)sc.pool,(unsigned long long)sc.pa);
 + if(!pn||(sc.pa&0xffff)){err=ENOMEM;goto out;}
 + for(uint32_t off=0;off<POOL_SIZE;off+=PAGE_SIZE)
 +  if(ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(sc.pool+off)))!=sc.pa+off){err=ENOMEM;goto out;}
