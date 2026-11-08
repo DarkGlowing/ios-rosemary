@@ -1,18 +1,22 @@
 diff --git a/bsd/dev/rosemary_ufs.c b/bsd/dev/rosemary_ufs.c
-index 62889e1..a9e5538 100644
+index 62889e1..bbd2550 100644
 --- a/bsd/dev/rosemary_ufs.c
 +++ b/bsd/dev/rosemary_ufs.c
-@@ -686,10 +686,17 @@ static uint32_t rosemary_log_secs = ROSEMARY_LOG_SECS;
- /* Called for all console output, any context: never blocks. */
- void rosemary_log_append(const char *c, int size);
- 
+@@ -681,6 +681,13 @@ rosemary_ufs_init(void)
+ static char rosemary_log_ring[ROSEMARY_LOG_SIZE];
+ static uint64_t _Atomic rosemary_log_total;
+ static int rosemary_log_chan;
 +/*
 + * Set while the pager prints a page: the page comes out of this ring, so
 + * recording it again would push the log it is showing out of the window and
-+ * the pager would end up displaying itself.
++ * the pager would end up displaying itself. bsd/dev/rosemary_beat.c
 + */
 +int rosemary_log_pause;
 +
+ static uint32_t rosemary_log_secs = ROSEMARY_LOG_SECS;
+ 
+ /* Called for all console output, any context: never blocks. */
+@@ -689,7 +696,7 @@ void rosemary_log_append(const char *c, int size);
  void
  rosemary_log_append(const char *c, int size)
  {
@@ -21,10 +25,10 @@ index 62889e1..a9e5538 100644
  		return;
  	}
  	uint64_t at = os_atomic_add_orig(&rosemary_log_total, (uint64_t)size, relaxed);
-@@ -698,6 +705,40 @@ rosemary_log_append(const char *c, int size)
- 	}
+@@ -788,4 +795,38 @@ rosemary_ufs_rootdev(dev_t *dev)
+ 	*dev = su.bdev;
+ 	return 0;
  }
- 
 +/*
 + * Read side of the ring, for the boot-log pager (bsd/dev/rosemary_beat.c).
 + *
@@ -59,6 +63,4 @@ index 62889e1..a9e5538 100644
 +	return n;
 +}
 +
- struct rosemary_log_header {
- 	char magic[8];
- 	uint32_t version, size;
+ #endif /* ARM64_BOARD_CONFIG_ROSEMARY */
