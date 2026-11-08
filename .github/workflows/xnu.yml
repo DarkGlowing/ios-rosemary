@@ -95,36 +95,44 @@ jobs:
           find dxb/xnu dxb/build -type f -exec touch -m {} + 2>/dev/null || true
           echo "touched $(find dxb/xnu -type f 2>/dev/null | wc -l) source files"
 
-      - name: Install Kernel Debug Kit (retrying download)
+      - name: Install Kernel Debug Kit (any working release)
         run: |
           set -euo pipefail
-          KDK_NAME="${KDK_NAME:-Kernel Debug Kit 13.5 build 22G74}"
-          KDKROOT="${KDKROOT:-/Library/Developer/KDKs/KDK_13.5_22G74.kdk/}"
-          if [ -d "$KDKROOT" ]; then
-            echo "KDK already installed at $KDKROOT"
+          existing=$(ls -d /Library/Developer/KDKs/KDK_*.kdk 2>/dev/null | head -1 || true)
+          if [ -n "$existing" ]; then
+            echo "Using installed KDK: $existing"
+            echo "KDKROOT=$existing/" >> "$GITHUB_ENV"
             exit 0
           fi
-          URL=$(curl -sSL https://raw.githubusercontent.com/dortania/KdkSupportPkg/gh-pages/manifest.json \
-                | jq -r --arg n "$KDK_NAME" '.[] | select(.name==$n) | .url' | head -1)
-          echo "KDK url: $URL"
-          [ -n "$URL" ] && [ "$URL" != "null" ]
-          for attempt in 1 2 3 4; do
-            echo "download attempt $attempt"
+          MANIFEST=https://raw.githubusercontent.com/dortania/KdkSupportPkg/gh-pages/manifest.json
+          curl -sSL "$MANIFEST" -o /tmp/kdk.json
+          # Preferred version first, then any other release: a single GitHub
+          # asset can return 504 while the rest are fine.
+          for name in "Kernel Debug Kit 13.5 build 22G74" $(jq -r '.[].name' /tmp/kdk.json | head -12); do
+            url=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .url' /tmp/kdk.json | head -1)
+            [ -n "$url" ] && [ "$url" != "null" ] || continue
+            echo "trying: $name"
             rm -f /tmp/KDK.dmg
-            if curl -L --fail --retry 3 --retry-delay 10 --max-time 1800 -o /tmp/KDK.dmg "$URL" \
-               && hdiutil attach /tmp/KDK.dmg -noverify -mountpoint /tmp/kdkmnt; then
-              if compgen -G "/tmp/kdkmnt/*.pkg" > /dev/null; then
-                sudo installer -pkg /tmp/kdkmnt/*.pkg -target /
-              else
-                sudo cp -R /tmp/kdkmnt/*.kdk /Library/Developer/KDKs/
-              fi
-              hdiutil detach /tmp/kdkmnt || true
-              [ -d "$KDKROOT" ] && { echo "KDK installed"; exit 0; }
+            if ! curl -L --fail --max-time 900 --connect-timeout 60 -o /tmp/KDK.dmg "$url"; then
+              echo "download failed for $name"; continue
             fi
-            hdiutil detach /tmp/kdkmnt 2>/dev/null || true
-            sleep $((attempt * 15))
+            if ! hdiutil attach /tmp/KDK.dmg -noverify -mountpoint /tmp/kdkmnt; then
+              echo "attach failed for $name"; continue
+            fi
+            if compgen -G "/tmp/kdkmnt/*.pkg" >/dev/null; then
+              sudo installer -pkg /tmp/kdkmnt/*.pkg -target / || true
+            else
+              sudo cp -R /tmp/kdkmnt/*.kdk /Library/Developer/KDKs/ 2>/dev/null || true
+            fi
+            hdiutil detach /tmp/kdkmnt || true
+            installed=$(ls -d /Library/Developer/KDKs/KDK_*.kdk 2>/dev/null | head -1 || true)
+            if [ -n "$installed" ]; then
+              echo "KDKROOT=$installed/" >> "$GITHUB_ENV"
+              echo "installed: $installed"
+              exit 0
+            fi
           done
-          echo "KDK download/install failed after retries"; exit 1
+          echo "no usable KDK could be installed"; exit 1
 
       - name: Build
         working-directory: dxb
