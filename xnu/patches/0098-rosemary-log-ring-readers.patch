@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/rosemary_ufs.c b/bsd/dev/rosemary_ufs.c
-index 62889e1..30e8e74 100644
+index 62889e1..a9e5538 100644
 --- a/bsd/dev/rosemary_ufs.c
 +++ b/bsd/dev/rosemary_ufs.c
 @@ -686,10 +686,17 @@ static uint32_t rosemary_log_secs = ROSEMARY_LOG_SECS;
@@ -32,17 +32,17 @@ index 62889e1..30e8e74 100644
 + * the middle of a console write, so neither function takes a lock: a byte is
 + * a byte, and a torn line at the wrap point only costs one line of the dump.
 + */
-+uint64_t rosemary_log_position(void);
-+uint32_t rosemary_log_copy(uint64_t *pos, char *out, uint32_t max);
++uint64_t rosemary_bootlog_position(void);
++uint32_t rosemary_bootlog_copy(uint64_t *pos, char *out, uint32_t max);
 +
 +uint64_t
-+rosemary_log_position(void)
++rosemary_bootlog_position(void)
 +{
 +	return os_atomic_load(&rosemary_log_total, relaxed);
 +}
 +
 +uint32_t
-+rosemary_log_copy(uint64_t *pos, char *out, uint32_t max)
++rosemary_bootlog_copy(uint64_t *pos, char *out, uint32_t max)
 +{
 +	uint64_t total = os_atomic_load(&rosemary_log_total, relaxed);
 +

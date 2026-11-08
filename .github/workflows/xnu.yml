@@ -15,6 +15,14 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      full_rebuild:
+        # The step below only runs when this input exists and is true; it was
+        # referenced but never declared, so the coordinated cache could serve
+        # objects older than the freshly patched sources without anyone
+        # noticing (a patched file that fails to compile under -k silently
+        # keeps its cached object).
+        description: ignore the object cache (touch every source, full rebuild)
+        default: "false"
   push:
     branches: [main]
     paths:
@@ -182,7 +190,33 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+
+      - name: Diagnose the boot-diagnostic patches (0098-0100)
+        # Two different failures used to look the same ("marker missing from
+        # the kernel"): the patch was skipped because its context did not match
+        # (different set of earlier patches applied), or it applied but the file
+        # failed to compile and -k kept the old object. This step says which.
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "=== patches handed to the build ==="
+          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* || echo "MISSING FROM REPO"
+          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* || echo "MISSING FROM dxb/patches"
+          echo "=== did the patches reach the sources? (dxb/xnu is patched by build.sh) ==="
+          grep -c 'ROSEMARY MATCH' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
+          grep -c 'rosemary_beat_start' dxb/xnu/pexpert/arm/pe_init.c 2>&1 || true
+          grep -c 'rosemary_bootlog_copy' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
+          ls -l dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || echo "rosemary_beat.c MISSING (0100 skipped)"
+          grep -n 'rosemary_beat.c' dxb/xnu/bsd/conf/files 2>&1 || echo "conf/files entry MISSING"
+          echo "=== compile errors that could explain a stale object (-k keeps going) ==="
+          grep -nE 'error:' dxb/build.log 2>/dev/null | grep -E 'IOService\.cpp|pe_init\.c|rosemary_beat\.c|rosemary_ufs\.c' | head -30 || true
+          echo "=== all errors (first 20) ==="
+          grep -nE 'error:' dxb/build.log 2>/dev/null | head -20 || true
+          echo "=== applied / skipped patches ==="
+          grep -E 'Applying patch|Skipping patch' dxb/build.log 2>/dev/null | tail -40 || true
 
       - name: Verify the patched source really has the diag
         if: always()

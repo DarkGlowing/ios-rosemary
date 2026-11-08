@@ -12,7 +12,7 @@ index 9b6ccdb..6340d27 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/rosemary_beat.c b/bsd/dev/rosemary_beat.c
 new file mode 100644
-index 0000000..e1fb838
+index 0000000..b5f84f8
 --- /dev/null
 +++ b/bsd/dev/rosemary_beat.c
 @@ -0,0 +1,169 @@
@@ -57,8 +57,8 @@ index 0000000..e1fb838
 +
 +/* bsd/dev/rosemary_ufs.c */
 +#define ROSEMARY_LOG_RING       (4u << 20)
-+extern uint64_t rosemary_log_position(void);
-+extern uint32_t rosemary_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t rosemary_bootlog_position(void);
++extern uint32_t rosemary_bootlog_copy(uint64_t *pos, char *out, uint32_t max);
 +/* osfmk/console/serial_console.c: set by AppleCLCD when the GUI takes over */
 +extern int rosemary_console_muted;
 +/* bsd/dev/rosemary_ufs.c: set while a page is printed, so the pager does not
@@ -85,7 +85,7 @@ index 0000000..e1fb838
 +rosemary_page(void)
 +{
 +	static char page[8192];
-+	uint64_t total = rosemary_log_position();
++	uint64_t total = rosemary_bootlog_position();
 +	uint64_t oldest = total > ROSEMARY_LOG_RING ? total - ROSEMARY_LOG_RING : 0;
 +
 +	if (rosemary_page_bytes + 64 > sizeof(page)) {
@@ -110,7 +110,7 @@ index 0000000..e1fb838
 +	uint32_t n = 0;
 +
 +	while (n + 1 < sizeof(page)) {
-+		uint32_t k = rosemary_log_copy(&pos, page + n,
++		uint32_t k = rosemary_bootlog_copy(&pos, page + n,
 +		    (uint32_t)(sizeof(page) - 1 - n));
 +		if (k == 0) {
 +			break;
