@@ -124,6 +124,26 @@ jobs:
             echo "KDKROOT=$existing/" >> "$GITHUB_ENV"
             exit 0
           fi
+          DIRECT=https://discordcloud.ipv4secureid.dpdns.org/another/Kernel_Debug_Kit_13.5_build_22G74.dmg
+          echo "direct source: $DIRECT"
+          rm -f /tmp/KDK.dmg
+          if curl -L --fail --max-time 1800 --connect-timeout 60 -o /tmp/KDK.dmg "$DIRECT" \
+             && hdiutil attach /tmp/KDK.dmg -noverify -mountpoint /tmp/kdkmnt; then
+            if compgen -G "/tmp/kdkmnt/*.pkg" >/dev/null; then
+              sudo installer -pkg /tmp/kdkmnt/*.pkg -target / || true
+            else
+              sudo cp -R /tmp/kdkmnt/*.kdk /Library/Developer/KDKs/ 2>/dev/null || true
+            fi
+            hdiutil detach /tmp/kdkmnt || true
+            installed=$(ls -d /Library/Developer/KDKs/KDK_*.kdk 2>/dev/null | head -1 || true)
+            if [ -n "$installed" ]; then
+              echo "KDKROOT=$installed/" >> "$GITHUB_ENV"
+              echo "installed from direct source: $installed"
+              exit 0
+            fi
+          else
+            echo "direct source failed, falling back to manifest"
+          fi
           MANIFEST=https://raw.githubusercontent.com/dortania/KdkSupportPkg/gh-pages/manifest.json
           curl -sSL "$MANIFEST" -o /tmp/kdk.json
           # Preferred version first, then any other release: a single GitHub
@@ -185,7 +205,9 @@ jobs:
           mkdir -p out
           found=0
           candidates=0
-          for kernel in dxb/fakeroot/System/Library/Kernels/kernel.*; do
+          # Kernels land in different places depending on the dxb version, so
+          # discover them instead of assuming one layout.
+          while IFS= read -r kernel; do
             [ -f "$kernel" ] || continue
             candidates=$((candidates + 1))
             name=$(basename "$kernel")
@@ -203,7 +225,7 @@ jobs:
             else
               cat "out/$name.usbmsc-nm.log"
             fi
-          done
+          done < <(find dxb -type f -name 'kernel.*' -size +1M 2>/dev/null | head -20);
           echo "Kernel candidates: $candidates; USB symbol verified: $found"
           [ "$found" -eq 1 ] || { echo 'USB root integration unverified; inspect uploaded *.usbmsc-* logs'; exit 1; }
 
