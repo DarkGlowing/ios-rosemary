@@ -204,6 +204,10 @@ jobs:
           git apply --numstat xnu/patches/0093-rosemary-usbmsc.patch
           cmp xnu/additions/rosemary_usbmsc.c dxb/xnu/bsd/dev/rosemary_usbmsc.c
           grep -F 'bsd/dev/rosemary_usbmsc.c' dxb/xnu/bsd/conf/files
+          grep -F 'ROSEMARY bsd_init: entered' dxb/xnu/bsd/kern/bsd_init.c \
+            || { echo 'ERROR: 0096 bsd_init markers not applied'; exit 1; }
+          grep -F 'IOKitBSDInit reached' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp \
+            || { echo 'ERROR: 0095/0096 root marker not applied'; exit 1; }
           grep -F 'rosemary_usbmsc_rootdev(root)' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp
           mkdir -p out
           found=0
