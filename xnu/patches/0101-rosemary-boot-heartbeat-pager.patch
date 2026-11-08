@@ -12,10 +12,10 @@ index 9b6ccdb..6340d27 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/rosemary_beat.c b/bsd/dev/rosemary_beat.c
 new file mode 100644
-index 0000000..7a96b23
+index 0000000..4dce893
 --- /dev/null
 +++ b/bsd/dev/rosemary_beat.c
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,206 @@
 +/*
 + * ROSEMARY boot heartbeat and boot-log pager.
 + *
@@ -59,6 +59,8 @@ index 0000000..7a96b23
 +#define ROSEMARY_LOG_RING       (4u << 20)
 +extern uint64_t rosemary_bootlog_position(void);
 +extern uint32_t rosemary_bootlog_copy(uint64_t *pos, char *out, uint32_t max);
++/* bsd/dev/rosemary_ufs.c: MTK top RGU, also petted from the console path */
++extern void rosemary_wdt_pet(void);
 +/* osfmk/console/serial_console.c: set by AppleCLCD when the GUI takes over */
 +extern int rosemary_console_muted;
 +/* bsd/dev/rosemary_ufs.c: set while a page is printed, so the pager does not
@@ -158,6 +160,8 @@ index 0000000..7a96b23
 +		(void)tsleep(&rosemary_beat_chan, PZERO, "rosemarybt",
 +		    hz * (int)rosemary_beat_secs);
 +		rosemary_beat_count++;
++		/* Console output feeds the watchdog too, but a silent hang does not. */
++		rosemary_wdt_pet();
 +
 +		/*
 +		 * Never interleave with the boot's own output: writing a dot from
