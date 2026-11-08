@@ -95,6 +95,14 @@ jobs:
           find dxb/xnu dxb/build -type f -exec touch -m {} + 2>/dev/null || true
           echo "touched $(find dxb/xnu -type f 2>/dev/null | wc -l) source files"
 
+      - name: Cache Kernel Debug Kit
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/kdk.dmg
+            /Library/Developer/KDKs
+          key: kdk-${{ env.MACOS_VERSION }}-22G74
+
       - name: Install Kernel Debug Kit (any working release)
         run: |
           set -euo pipefail
