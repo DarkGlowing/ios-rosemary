@@ -89,9 +89,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dxb/build
-          key: buildobj-v2-${{ env.MACHINE_CONFIG }}-${{ github.sha }}
+          # v3: v2 was restored by prefix on every run, and a patched file that
+          # failed to compile under `make -k` kept its cached object, so several
+          # builds shipped a kernel identical to the previous one while the
+          # sources had changed. A version bump forces one honest full build.
+          key: buildobj-v3-${{ env.MACHINE_CONFIG }}-${{ github.sha }}
           restore-keys: |
-            buildobj-v2-${{ env.MACHINE_CONFIG }}-
+            buildobj-v3-${{ env.MACHINE_CONFIG }}-
 
       - name: Force full rebuild (defeat stale objects)
         # Full rebuild is opt-in: set the full_rebuild input when a stale
