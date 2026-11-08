@@ -81,9 +81,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dxb/build
-          key: buildobj-${{ env.MACHINE_CONFIG }}-${{ github.sha }}
+          key: buildobj-v2-${{ env.MACHINE_CONFIG }}-${{ github.sha }}
           restore-keys: |
-            buildobj-${{ env.MACHINE_CONFIG }}-
+            buildobj-v2-${{ env.MACHINE_CONFIG }}-
 
       - name: Force full rebuild (defeat stale objects)
         # Full rebuild is opt-in: set the full_rebuild input when a stale
@@ -205,9 +205,11 @@ jobs:
           cmp xnu/additions/rosemary_usbmsc.c dxb/xnu/bsd/dev/rosemary_usbmsc.c
           grep -F 'bsd/dev/rosemary_usbmsc.c' dxb/xnu/bsd/conf/files
           grep -F 'ROSEMARY bsd_init: entered' dxb/xnu/bsd/kern/bsd_init.c \
-            || { echo 'ERROR: 0096 bsd_init markers not applied'; exit 1; }
-          grep -F 'IOKitBSDInit reached' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp \
-            || { echo 'ERROR: 0095/0096 root marker not applied'; exit 1; }
+            || { echo 'ERROR: 0093 diagnostic hunk was not applied'; exit 1; }
+          grep -F 'ROSEMARY bsd_init: before bsd_autoconf' dxb/xnu/bsd/kern/bsd_init.c \
+            || { echo 'ERROR: bsd_init trace missing'; exit 1; }
+          grep -F 'ROSEMARY root: IOKitBSDInit reached' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp \
+            || { echo 'ERROR: root marker missing'; exit 1; }
           grep -F 'rosemary_usbmsc_rootdev(root)' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp
           mkdir -p out
           found=0
@@ -276,19 +278,31 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          # The kit location differs between dxb versions; find it instead of
-          # trusting one path, and never report success with an empty artifact.
-          find dxb -type f -name 'kernel.*' \
-            ! -name '*.dSYM*' ! -name '*.unstripped' ! -name '*.txt' -size +1M \
-            -exec cp {} out/ \;
+          # Only the development kernel is flashed; symbol dumps and .yml make
+          # the artifact huge (300+ MB) and download slowly.
+          found=0
+          for k in $(find dxb -type f -name 'kernel.development.rosemary' | head -5); do
+            cp "$k" out/kernel.development.rosemary; found=1; break
+          done
+          [ "$found" -eq 1 ] || {
+            find dxb -type f -name 'kernel.*' ! -name '*.dSYM*' ! -name '*.txt' \
+              ! -name '*.yml' ! -name '*.unstripped' -size +1M -exec cp {} out/ \;
+          }
           ls -la out
           compgen -G 'out/kernel.*' >/dev/null || {
             echo 'ERROR: no kernel was produced'; exit 1; }
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS)
+          test -f out/kernel.development.rosemary || {
+            echo 'ERROR: rosemary development kernel missing'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY bsd_init: entered' >/dev/null || {
+            echo 'ERROR: diagnostic patch 0096 missing from kernel'; exit 1; }
+          (cd out && shasum -a 256 kernel.development.rosemary > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: xnu-kernel
-          path: out/
-          if-no-files-found: warn
+          path: |
+            out/kernel.development.rosemary
+            out/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
