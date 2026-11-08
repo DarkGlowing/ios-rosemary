@@ -3,9 +3,9 @@
  *
  * This is deliberately the xnu12 behaviour, which is the only variant proven
  * to move data on this device:
- *   - write a boot record at LBA+0 of each target and the log at LBA+8;
- *   - targets are the START of expdb and the START of boot_b (both were read
- *     back successfully once);
+ *   - write a boot record at LBA+0 of the target and the log at LBA+8;
+ *   - the target is the START of expdb only: writing to the start of boot_b
+ *     would clobber the boot image we booted from;
  *   - on success reboot immediately with the hardware reset so LK boots us
  *     again and the cycle stays short (a long wait lets the slot fail over to
  *     Android, which wipes everything we care about);
@@ -41,8 +41,7 @@
 #define CANARY_MAGIC		0x314e4143584d4948ULL	/* "HIMXCAN1" */
 
 static const uint32_t target_lbas[] = {
-	776u,			/* expdb */
-	578304u,		/* boot_b, partition start */
+	776u,			/* expdb (20 MiB, never mounted) */
 };
 #define NTARGETS (sizeof(target_lbas) / sizeof(target_lbas[0]))
 

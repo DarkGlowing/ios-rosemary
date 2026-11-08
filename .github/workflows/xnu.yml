@@ -299,6 +299,17 @@ jobs:
             echo 'ERROR: rosemary development kernel missing'; exit 1; }
           strings out/kernel.development.rosemary | grep -F 'ROSEMARY bsd_init: entered' >/dev/null || {
             echo 'ERROR: diagnostic patch 0096 missing from kernel'; exit 1; }
+          # 0099/0100: per-candidate IOKit matching trace and the heartbeat/pager.
+          # Without these a boot that stops after AppleKeyStore registers shows
+          # nothing at all, which is exactly the state we are debugging.
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY MATCH:' >/dev/null || {
+            echo 'ERROR: boot trace patch 0099 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BEAT: start' >/dev/null || {
+            echo 'ERROR: heartbeat patch 0100 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY LOGPAGE: bytes' >/dev/null || {
+            echo 'ERROR: log pager patch 0100 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'StartIOKitMatching enter' >/dev/null || {
+            echo 'ERROR: IOKit matching markers missing from kernel'; exit 1; }
           (cd out && shasum -a 256 kernel.development.rosemary > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4

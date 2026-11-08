@@ -100,6 +100,29 @@ gzip -9 -n -c out/Image-usb > out/Image-usb.gz
 mkbootimg "${COMMON[@]}" --kernel out/Image-usb.gz --ramdisk out/ramdisk-diag.bin \
 	-o out/shim-usbdiag.img
 
+# ---- same shim with the watchdog left armed (-DSHIM_KEEP_WDT) --------------
+# The other half of the DRAM experiment: a hang must end in a *warm* reset
+# (watchdog) instead of a power-key power cycle, because only a warm reset can
+# keep DRAM, and only then does the next boot have an XNU log to collect.
+# loader.c then prints the canary result and copies the log into expdb.
+mkdir -p out/wdt
+for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c xnulog.c \
+	platform_mt6785.c; do
+	$CC $CFLAGS -DSHIM_KEEP_WDT -c $f -o out/wdt/${f%.*}.o
+done
+$CC $CFLAGS -static -T shim.ld $LDFLAGS out/wdt/*.o -o out/wdt/shim.elf
+$OBJCOPY -O binary out/wdt/shim.elf out/Image-wdt
+size=$($NM out/wdt/shim.elf | python3 -c 'import sys
+for l in sys.stdin:
+    p=l.split()
+    if len(p)==3 and p[2]=="_end": print(int(p[0],16))')
+truncate -s "$size" out/Image-wdt
+gzip -9 -n -c out/Image-wdt > out/Image-wdt.gz
+if [ -s out/ramdisk-xnu.bin ]; then
+	mkbootimg "${COMMON[@]}" --kernel out/Image-wdt.gz --ramdisk out/ramdisk-xnu.bin \
+		-o out/shim-xnu-wdt.img
+fi
+
 # Full-partition variants: zeros all the way to the end of the 64 MiB boot
 # partition, which removes any stale AVB footer left by a previous image.
 python3 - <<'EOF'

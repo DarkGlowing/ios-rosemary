@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index f2d21bf..8452666 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -4145,7 +4145,17 @@ IOService::probeCandidates( OSOrderedSet * matches )
+ 						 * If a dext fails to start because an upgrade happened
+ 						 * concurrently, then the matching process has to restart
+ 						 */
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++						/* ROSEMARY: the boot stops inside this loop today, so every
++						 * candidate is announced and its result printed. A missing
++						 * "started" line names the driver that hung. */
++						kprintf("ROSEMARY MATCH: %s <- %s\n", inst->getName(), getName());
++#endif
+ 						started = startCandidate( inst );
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++						kprintf("ROSEMARY MATCH: %s started %d\n", inst->getName(),
++						    (int)started);
++#endif
+ #if IOMATCHDEBUG
+ 						if ((debugFlags & kIOLogStart) && (false == started)) {
+ 							LOG( "%s::start(%s) <%d> failed\n", inst->getName(), getName(),
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 04dda53..3a1b578 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -379,7 +379,22 @@ PE_lockdown_iokit(void)
+ 	 * hardware protections.
+ 	 */
+ 	zalloc_iokit_lockdown();
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++	/*
++	 * The heartbeat comes up before IOKit matching, which is where the boot
++	 * stops today (the last console line is AppleKeyStore registering).
++	 * From here on a thread prints a dot every second and pages the console
++	 * ring to the panel once the boot is clearly stuck, so a hang is visible
++	 * without a serial port. bsd/dev/rosemary_beat.c
++	 */
++	extern void rosemary_beat_start(void);
++	rosemary_beat_start();
++	kprintf("ROSEMARY IOKIT: StartIOKitMatching enter\n");
++#endif
+ 	StartIOKitMatching();
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++	kprintf("ROSEMARY IOKIT: StartIOKitMatching returned\n");
++#endif
+ }
+ 
+ void

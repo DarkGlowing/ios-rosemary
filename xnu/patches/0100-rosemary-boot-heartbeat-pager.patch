@@ -1,0 +1,187 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9b6ccdb..6340d27 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/rosemary_ufs.c			standard
+ bsd/dev/rosemary_sample.c			standard
++bsd/dev/rosemary_beat.c			standard
+ bsd/dev/rosemary_keys.c			standard
+ bsd/dev/rosemary_touch.c			standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/rosemary_beat.c b/bsd/dev/rosemary_beat.c
+new file mode 100644
+index 0000000..e1fb838
+--- /dev/null
++++ b/bsd/dev/rosemary_beat.c
+@@ -0,0 +1,169 @@
++/*
++ * ROSEMARY boot heartbeat and boot-log pager.
++ *
++ * The phone has no usable serial port, no ADB while XNU runs, and the log a
++ * previous boot leaves in DRAM does not survive the reset to Android. The
++ * only output channel that always exists is the panel, and it shows 67x74
++ * characters, so a boot that stops leaves at most the last screen.
++ *
++ * This thread answers the two questions that matter when the boot stops:
++ *
++ *   - is the kernel alive? Every second it prints one character ("." and a
++ *     "ROSEMARY BEAT n" line every 15 s). If the dots continue after the last
++ *     driver message, the machine is alive and only the bootstrap thread is
++ *     stuck; if they stop, the CPU is spinning with interrupts off or the
++ *     console itself died.
++ *
++ *   - what did it print? The full console ring (bsd/dev/rosemary_ufs.c,
++ *     fed from _cnputs, 4 MiB) is paged to the screen after the boot is
++ *     clearly stuck: 60 lines per page, the last page first, then backwards
++ *     to the oldest byte, then round again, so every page can be photographed
++ *     and read offline.
++ *
++ * Boot args: rosemarybeat=SECS (tick, default 1), rosemarypage=SECS (first
++ * page after this many seconds, default 40), rosemarypageevery=SECS
++ * (default 20). rosemarypage=0 disables paging.
++ */
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++
++/* Not exported to the BSD layer by the headers above. */
++extern int hz;
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++/* bsd/dev/rosemary_ufs.c */
++#define ROSEMARY_LOG_RING       (4u << 20)
++extern uint64_t rosemary_log_position(void);
++extern uint32_t rosemary_log_copy(uint64_t *pos, char *out, uint32_t max);
++/* osfmk/console/serial_console.c: set by AppleCLCD when the GUI takes over */
++extern int rosemary_console_muted;
++/* bsd/dev/rosemary_ufs.c: set while a page is printed, so the pager does not
++ * record its own output into the ring it is reading from. */
++extern int rosemary_log_pause;
++
++void rosemary_beat_start(void);
++
++static uint32_t rosemary_beat_secs = 1;
++static uint32_t rosemary_beat_line = 15;        /* full line every N ticks */
++static uint32_t rosemary_page_from = 40;        /* first page, seconds */
++static uint32_t rosemary_page_every = 20;       /* next pages, seconds */
++static uint32_t rosemary_page_bytes = 6000;     /* ~75 lines of 80 chars */
++static int rosemary_beat_chan;
++
++static uint32_t rosemary_beat_count;
++static uint64_t rosemary_page_end;              /* ring position after the last page */
++
++/*
++ * Print one page of the console ring: the bytes just before
++ * rosemary_page_end, walking backwards from the tail of the log.
++ */
++static void
++rosemary_page(void)
++{
++	static char page[8192];
++	uint64_t total = rosemary_log_position();
++	uint64_t oldest = total > ROSEMARY_LOG_RING ? total - ROSEMARY_LOG_RING : 0;
++
++	if (rosemary_page_bytes + 64 > sizeof(page)) {
++		rosemary_page_bytes = (uint32_t)(sizeof(page) - 64);
++	}
++	if (rosemary_page_end == 0 || rosemary_page_end > total) {
++		rosemary_page_end = total;
++	}
++	uint64_t end = rosemary_page_end;
++	if (end <= oldest || total == 0) {
++		/* A whole pass is done (or nothing was logged yet): start from the tail. */
++		rosemary_page_end = total;
++		return;
++	}
++	uint64_t begin = end > rosemary_page_bytes ? end - rosemary_page_bytes : 0;
++
++	if (begin < oldest) {
++		begin = oldest;
++	}
++
++	uint64_t pos = begin;
++	uint32_t n = 0;
++
++	while (n + 1 < sizeof(page)) {
++		uint32_t k = rosemary_log_copy(&pos, page + n,
++		    (uint32_t)(sizeof(page) - 1 - n));
++		if (k == 0) {
++			break;
++		}
++		n += k;
++	}
++	page[n] = 0;
++
++	/* A page must start and end on a line boundary to be readable. */
++	rosemary_log_pause = 1;
++	printf("\nROSEMARY LOGPAGE: bytes %llu..%llu of %llu\n", begin, pos, total);
++	printf("%s", page);
++	printf("\nROSEMARY LOGPAGE: end (bytes %llu..%llu)\n", begin, pos);
++	rosemary_log_pause = 0;
++	rosemary_page_end = begin;
++}
++
++static void
++rosemary_beat_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t until_page = rosemary_page_from;
++	int page = 0;
++
++	printf("ROSEMARY BEAT: start (tick %us, first page after %us, then every %us)\n",
++	    rosemary_beat_secs, rosemary_page_from, rosemary_page_every);
++	for (;;) {
++		(void)tsleep(&rosemary_beat_chan, PZERO, "rosemarybt",
++		    hz * (int)rosemary_beat_secs);
++		rosemary_beat_count++;
++		if ((rosemary_beat_count % rosemary_beat_line) == 0) {
++			printf("ROSEMARY BEAT %u\n", rosemary_beat_count);
++		} else {
++			printf(".");
++		}
++		if (rosemary_page_every == 0) {
++			continue;
++		}
++		if (until_page > 0) {
++			until_page--;
++			continue;
++		}
++		/* Page the log, then give the reader time to photograph it. */
++		page++;
++		printf("ROSEMARY LOGPAGE: page %d\n", page);
++		rosemary_page();
++		until_page = rosemary_page_every;
++	}
++}
++
++void
++rosemary_beat_start(void)
++{
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("rosemarybeat", &rosemary_beat_secs, sizeof(rosemary_beat_secs));
++	if (rosemary_beat_secs == 0 || rosemary_beat_secs > 60) {
++		rosemary_beat_secs = 1;
++	}
++	(void)PE_parse_boot_argn("rosemarypage", &rosemary_page_from, sizeof(rosemary_page_from));
++	(void)PE_parse_boot_argn("rosemarypageevery", &rosemary_page_every, sizeof(rosemary_page_every));
++	if (rosemary_page_every == 0) {
++		printf("ROSEMARY BEAT: log paging disabled\n");
++	}
++
++	/* Paging must be visible even when AppleCLCD muted the console for the GUI. */
++	rosemary_console_muted = 0;
++
++	if (kernel_thread_start(rosemary_beat_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("ROSEMARY BEAT: thread start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_ROSEMARY */

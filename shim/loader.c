@@ -125,13 +125,28 @@ const char *loader_boot(uintptr_t dtb)
 	if (src_end > p->phys_base && src < p->phys_base + p->mem_size)
 		return "payload overlaps kernel memory";
 
-	/* Storage logging is disabled on purpose: the canary proved that DRAM
-	 * does not survive the reset, so there is never a log to copy, and writing
-	 * to expdb/boot_b only disturbs partitions. The console is the output now.
-	 * The watchdog has to go too: drawing a full 1080x2400 dump at uncached
-	 * framebuffer speed takes minutes, far longer than the 32 s timeout. */
+	/* Storage logging.
+	 *
+	 * Default build: no storage logging and no watchdog. The canary proved
+	 * that DRAM does not survive the reset here, and the last reset was a
+	 * long press on the power key (a PMIC power cycle) because the shim had
+	 * disabled the SoC watchdog before the jump: a power cycle always loses
+	 * DRAM, so that test could not have come out any other way.
+	 *
+	 * -DSHIM_KEEP_WDT builds the other half of the experiment: the watchdog
+	 * stays armed (same long timeout as the rest of the boot), so a hang ends
+	 * in a *warm* reset. If DRAM survives that, the next boot finds the XNU
+	 * log in it, reports the canary on screen and copies the log into expdb.
+	 */
+#ifdef SHIM_KEEP_WDT
+	wdt_init_long_timeout();
+	con_str("WDT", "armed: a hang gives a warm reset, then the log is collected");
+	xnulog_collect(p->phys_base, p->mem_size);
+	con_skip();
+#else
 	wdt_disable();
 	con_str("WDT", "off: long-press power to reboot");
+#endif
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
