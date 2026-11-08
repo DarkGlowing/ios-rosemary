@@ -99,9 +99,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            /tmp/kdk.dmg
-            /Library/Developer/KDKs
-          key: kdk-${{ env.MACOS_VERSION }}-22G74
+            /tmp/KDK.dmg
+          key: kdk-dmg-${{ env.MACOS_VERSION }}-22G74
 
       - name: Use SDK Kernel.framework as KDKROOT
         run: |
@@ -126,8 +125,12 @@ jobs:
           fi
           DIRECT=https://discordcloud.ipv4secureid.dpdns.org/another/Kernel_Debug_Kit_13.5_build_22G74.dmg
           echo "direct source: $DIRECT"
-          rm -f /tmp/KDK.dmg
-          if curl -L --fail --max-time 1800 --connect-timeout 60 -o /tmp/KDK.dmg "$DIRECT" \
+          if [ -s /tmp/KDK.dmg ]; then
+            echo "using cached dmg ($(du -h /tmp/KDK.dmg | cut -f1))"
+          else
+            curl -L --fail --max-time 1800 --connect-timeout 60 -o /tmp/KDK.dmg "$DIRECT" || true
+          fi
+          if [ -s /tmp/KDK.dmg ] \
              && hdiutil attach /tmp/KDK.dmg -noverify -mountpoint /tmp/kdkmnt; then
             if compgen -G "/tmp/kdkmnt/*.pkg" >/dev/null; then
               sudo installer -pkg /tmp/kdkmnt/*.pkg -target / || true
