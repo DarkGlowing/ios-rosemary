@@ -267,10 +267,17 @@ jobs:
       - name: Collect
         if: always()
         run: |
+          set -euo pipefail
           mkdir -p out
-          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          # The kit location differs between dxb versions; find it instead of
+          # trusting one path, and never report success with an empty artifact.
+          find dxb -type f -name 'kernel.*' \
+            ! -name '*.dSYM*' ! -name '*.unstripped' ! -name '*.txt' -size +1M \
+            -exec cp {} out/ \;
           ls -la out
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          compgen -G 'out/kernel.*' >/dev/null || {
+            echo 'ERROR: no kernel was produced'; exit 1; }
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         if: always()
