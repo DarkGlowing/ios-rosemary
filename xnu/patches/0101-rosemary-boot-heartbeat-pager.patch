@@ -12,10 +12,10 @@ index 9b6ccdb..6340d27 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/rosemary_beat.c b/bsd/dev/rosemary_beat.c
 new file mode 100644
-index 0000000..1a95609
+index 0000000..8f69e31
 --- /dev/null
 +++ b/bsd/dev/rosemary_beat.c
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,258 @@
 +/*
 + * ROSEMARY boot heartbeat and boot-log pager.
 + *
@@ -105,17 +105,23 @@ index 0000000..1a95609
 +
 +static uint32_t rosemary_beat_secs = 1;
 +static uint32_t rosemary_beat_line = 15;        /* full line every N ticks */
-+static uint32_t rosemary_page_from = 25;        /* first page, seconds */
-+static uint32_t rosemary_page_every = 15;       /* next pages, seconds */
-+static uint32_t rosemary_page_bytes = 4500;     /* ~75 lines of 80 chars */
++static uint32_t rosemary_page_from = 8;         /* first page, seconds */
++static uint32_t rosemary_page_every = 6;        /* next pages, seconds */
++static uint32_t rosemary_page_bytes = 3000;     /* ~50 lines of 80 chars */
++static int rosemary_page_back;                   /* walk backwards instead of tail */
 +static int rosemary_beat_chan;
 +
 +static uint32_t rosemary_beat_count;
 +static uint64_t rosemary_page_end;              /* ring position after the last page */
 +
 +/*
-+ * Print one page of the console ring: the bytes just before
-+ * rosemary_page_end, walking backwards from the tail of the log.
++ * Print one page of the console ring.
++ *
++ * Default mode is a rolling tail: every page shows the last page_bytes of the
++ * log as it is *now*. That is the only useful mode for a boot that dies - the
++ * page on screen at the moment of death is the end of the log. rosemarypageback=1
++ * walks backwards from the tail instead, for reading a long log from a machine
++ * that stays alive.
 + */
 +static void
 +rosemary_page(void)
@@ -123,21 +129,30 @@ index 0000000..1a95609
 +	static char pg[8192];
 +	uint64_t log_total = rosemary_bootlog_position();
 +	uint64_t log_oldest = log_total > ROSEMARY_LOG_RING ? log_total - ROSEMARY_LOG_RING : 0;
++	uint64_t page_end_pos;
++
++	if (log_total == 0) {
++		return;
++	}
++	if (rosemary_page_back) {
++		if (rosemary_page_end == 0 || rosemary_page_end > log_total) {
++			rosemary_page_end = log_total;
++		}
++		if (rosemary_page_end <= log_oldest) {
++			/* A whole pass is done: start again from the tail. */
++			rosemary_page_end = log_total;
++		}
++		page_end_pos = rosemary_page_end;
++	} else {
++		page_end_pos = log_total;
++	}
 +
 +	if (rosemary_page_bytes + 64 > sizeof(pg)) {
 +		rosemary_page_bytes = (uint32_t)(sizeof(pg) - 64);
 +	}
-+	if (rosemary_page_end == 0 || rosemary_page_end > log_total) {
-+		rosemary_page_end = log_total;
-+	}
-+	uint64_t page_end_pos = rosemary_page_end;
-+	if (page_end_pos <= log_oldest || log_total == 0) {
-+		/* A whole pass is done (or nothing was logged yet): start from the tail. */
-+		rosemary_page_end = log_total;
-+		return;
-+	}
-+	uint64_t page_begin = page_end_pos > rosemary_page_bytes ? page_end_pos - rosemary_page_bytes : 0;
 +
++	uint64_t page_begin = page_end_pos > rosemary_page_bytes ?
++	    page_end_pos - rosemary_page_bytes : 0;
 +	if (page_begin < log_oldest) {
 +		page_begin = log_oldest;
 +	}
@@ -161,7 +176,9 @@ index 0000000..1a95609
 +	printf("%s", pg);
 +	printf("\nROSEMARY LOGPAGE: end (bytes %llu..%llu)\n", page_begin, pos);
 +	rosemary_log_pause = 0;
-+	rosemary_page_end = page_begin;
++	if (rosemary_page_back) {
++		rosemary_page_end = page_begin;
++	}
 +}
 +
 +static void
@@ -223,6 +240,7 @@ index 0000000..1a95609
 +	}
 +	(void)PE_parse_boot_argn("rosemarypage", &rosemary_page_from, sizeof(rosemary_page_from));
 +	(void)PE_parse_boot_argn("rosemarypageevery", &rosemary_page_every, sizeof(rosemary_page_every));
++	(void)PE_parse_boot_argn("rosemarypageback", &rosemary_page_back, sizeof(rosemary_page_back));
 +	if (rosemary_page_every == 0) {
 +		printf("ROSEMARY BEAT: log paging disabled\n");
 +	}
