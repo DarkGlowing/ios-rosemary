@@ -1805,3 +1805,41 @@ unlocked)` и останавливается; маркеры `bsd_init`/`IOKitBS
 **Порядок.** (1) обычный образ → фото пульса и страниц; (2) образ `-wdt` →
 один прогон до зависания, затем второй запуск и чтение `CANARY`; если DRAM
 выжил — переносим 4-МиБ кольцо в `expdb` и логи больше не фотографируем.
+
+### 7.42.1 Результат прогона k23 (2026-11-08): AKS пройден, но телефон сбрасывается
+
+Ядро 23 с настоящим кодом (кеш объектов v3 снял «замороженные» объекты) прошло
+дальше, чем когда-либо:
+
+```
+ROSEMARY IOKit: StartIOKitMatching enter
+ROSEMARY MATCH: RosemaryPlatformExpert <- D22AP      ... started 1
+ROSEMARY MATCH: AppleKeyStore <- IOResources         ... started 1
+ROSEMARY MATCH: IOWatchdog <- IOResources            ... started 1
+ROSEMARY MATCH: IOCoreSurfaceRoot <- IOResources     ... started 1
+ROSEMARY MATCH: RosemaryHIDButtons / HIDTouch        ... started 1
+ROSEMARY MATCH: AppleCLCD <- disp0                   ... started 1
+ROSEMARY IOKit: StartIOKitMatching returned
+../../..........ROSEMARY BEAT 15
+zone_init: map GEN0…DATA…, VM bootstrap done, IOKit IOMD setownership ENABLED
+```
+
+То есть блокер «стоит на AppleKeyStore» был артефактом кеша объектов: патч
+`no_aks` в ядро не попадал. Реальная смерть — позже и без паники: последняя
+строка на экране, затем сброс в загрузчик через ~25–30 с.
+
+Что это значит:
+
+- паники нет (её текст печатается) → либо спин/сброс железа, либо смерть до
+  того, как консоль успела что-то сказать;
+- 25–30 с — ровно тот интервал, на который шайм взводил A7 WDT
+  (`wdt_init_long_timeout`, длина 0xfff), а `wdt_disable()` снимает только бит
+  `EN` **этого** экземпляра: либо он не сработал, либо LK/PMIC держат второй;
+- битые/склеенные строки в логе (`ROSEMARY IOKit` вместо `IOKIT`, обрыв
+  `…subsystem is initialized`) — следствие того, что поток пульса печатал точки
+  посреди `kprintf` bootstrap-потока.
+
+Поэтому в сборку добавлено: поглаживание top RGU (`0x10007000 + 8`, ключ
+`0x1971`) раз в тик с печатью `ROSEMARY WDT: mode= length=`, печать фазы
+`ROSEMARY PHASE: <имя>` на каждом переходе startup-подсистемы и правило «точка
+только если консоль молчала весь тик».
