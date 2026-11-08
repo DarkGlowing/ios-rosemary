@@ -604,3 +604,31 @@ new file mode 100644
 + lck_mtx_unlock(&usbmsc_lock);return err;
 +}
 +
+diff --git a/iokit/Kernel/arm/RosemaryKeyStore.cpp b/iokit/Kernel/arm/RosemaryKeyStore.cpp
+--- a/iokit/Kernel/arm/RosemaryKeyStore.cpp
++++ b/iokit/Kernel/arm/RosemaryKeyStore.cpp
+@@ -64,15 +64,24 @@
+ 
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	static bool s_disabled;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleKeyStore, IOService);
++
++bool AppleKeyStore::s_disabled;
+ 
+ bool
+ AppleKeyStore::start(IOService *provider)
+ {
++	int off = 0;
++	PE_parse_boot_argn("no_aks", &off, sizeof(off));
+ 	if (!IOService::start(provider)) {
+ 		return false;
++	}
++	if (off) {
++		IOLog("ROSEMARY AKS: registration skipped by no_aks\n");
++		return true;
+ 	}
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	registerService();
