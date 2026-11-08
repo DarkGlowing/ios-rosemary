@@ -399,9 +399,13 @@ jobs:
             echo 'ERROR: IOKit sweep marker patch 0099 missing from kernel'; exit 1; }
           strings out/kernel.development.rosemary | grep -F 'ROSEMARY WDT: mode=' >/dev/null || {
             echo 'ERROR: watchdog patch 0098 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BOOT: calling bsd_init' >/dev/null || {
+          # The markers print through a format string, so the literal in the
+          # binary is "ROSEMARY BOOT: %s"; the label is a separate string.
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BOOT: %s' >/dev/null || {
             echo 'ERROR: bootstrap markers patch 0104 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY PHASE:' >/dev/null || {
+          strings out/kernel.development.rosemary | grep -F 'calling bsd_init' >/dev/null || {
+            echo 'ERROR: bootstrap markers patch 0104 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY PHASE: %s' >/dev/null || {
             echo 'ERROR: startup phase names missing from kernel'; exit 1; }
           (cd out && shasum -a 256 kernel.development.rosemary > SHA256SUMS)
 
