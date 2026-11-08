@@ -103,7 +103,19 @@ jobs:
             /Library/Developer/KDKs
           key: kdk-${{ env.MACOS_VERSION }}-22G74
 
+      - name: Use SDK Kernel.framework as KDKROOT
+        run: |
+          set -euo pipefail
+          sdk=$(xcrun --sdk macosx --show-sdk-path)
+          fw="$sdk/System/Library/Frameworks/Kernel.framework"
+          ls -d "$fw" >/dev/null
+          echo "KDKROOT path: $fw"
+          echo "KDKROOT=$fw/" >> "$GITHUB_ENV"
+
       - name: Install Kernel Debug Kit (any working release)
+        # The dortania mirror currently answers 504; the SDK framework above is
+        # sufficient, so a failed download must not fail the job.
+        continue-on-error: true
         run: |
           set -euo pipefail
           existing=$(ls -d /Library/Developer/KDKs/KDK_*.kdk 2>/dev/null | head -1 || true)
