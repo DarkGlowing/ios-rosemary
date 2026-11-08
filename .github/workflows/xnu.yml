@@ -95,6 +95,37 @@ jobs:
           find dxb/xnu dxb/build -type f -exec touch -m {} + 2>/dev/null || true
           echo "touched $(find dxb/xnu -type f 2>/dev/null | wc -l) source files"
 
+      - name: Install Kernel Debug Kit (retrying download)
+        run: |
+          set -euo pipefail
+          KDK_NAME="${KDK_NAME:-Kernel Debug Kit 13.5 build 22G74}"
+          KDKROOT="${KDKROOT:-/Library/Developer/KDKs/KDK_13.5_22G74.kdk/}"
+          if [ -d "$KDKROOT" ]; then
+            echo "KDK already installed at $KDKROOT"
+            exit 0
+          fi
+          URL=$(curl -sSL https://raw.githubusercontent.com/dortania/KdkSupportPkg/gh-pages/manifest.json \
+                | jq -r --arg n "$KDK_NAME" '.[] | select(.name==$n) | .url' | head -1)
+          echo "KDK url: $URL"
+          [ -n "$URL" ] && [ "$URL" != "null" ]
+          for attempt in 1 2 3 4; do
+            echo "download attempt $attempt"
+            rm -f /tmp/KDK.dmg
+            if curl -L --fail --retry 3 --retry-delay 10 --max-time 1800 -o /tmp/KDK.dmg "$URL" \
+               && hdiutil attach /tmp/KDK.dmg -noverify -mountpoint /tmp/kdkmnt; then
+              if compgen -G "/tmp/kdkmnt/*.pkg" > /dev/null; then
+                sudo installer -pkg /tmp/kdkmnt/*.pkg -target /
+              else
+                sudo cp -R /tmp/kdkmnt/*.kdk /Library/Developer/KDKs/
+              fi
+              hdiutil detach /tmp/kdkmnt || true
+              [ -d "$KDKROOT" ] && { echo "KDK installed"; exit 0; }
+            fi
+            hdiutil detach /tmp/kdkmnt 2>/dev/null || true
+            sleep $((attempt * 15))
+          done
+          echo "KDK download/install failed after retries"; exit 1
+
       - name: Build
         working-directory: dxb
         env:
