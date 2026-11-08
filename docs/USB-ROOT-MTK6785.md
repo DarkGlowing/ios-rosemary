@@ -1753,7 +1753,7 @@ CRCR = 0x18 — это и есть спека, а не «сдвиг +8». Зна
 3. Параллельно не бросать microSD: это единственный путь, который реально
    доводит до `hfs: mounted` за дни, а не недели.
 
-## 7.42 Прогон «диагностика зависания после AKS» (2026-11-08): патчи 0098–0100
+## 7.42 Прогон «диагностика зависания после AKS» (2026-11-08): патчи 0098–0101
 
 **Симптом.** Ядро печатает `ROSEMARY AKS: AppleKeyStore registered (no passcode,
 unlocked)` и останавливается; маркеры `bsd_init`/`IOKitBSDInit` не появляются,
@@ -1763,13 +1763,15 @@ unlocked)` и останавливается; маркеры `bsd_init`/`IOKitBS
 
 **Три приёма в одной сборке.**
 
-1. `0099-rosemary-boot-match-trace` — печать каждого кандидата IOKit:
+1. `0099-rosemary-iokit-sweep-markers` — `ROSEMARY IOKIT: StartIOKitMatching
+   enter` / `returned` в `iokit/Kernel/IOStartIOKit.cpp` (файл, который не
+   трогает больше ни один патч, поэтому ханк применяется всегда).
+2. `0100-rosemary-match-trace` — печать каждого кандидата IOKit:
    `ROSEMARY MATCH: <сервис> <- <провайдер>` перед `startCandidate()` и
-   `ROSEMARY MATCH: <сервис> started 0|1` после. Плюс маркеры вокруг
-   `StartIOKitMatching()` в `pexpert/arm/pe_init.c`. Если строка `started`
-   не появилась — встал именно этот драйвер; если не появилась и пара
-   `<-` — встал сам цикл сопоставления.
-2. `0100-rosemary-boot-heartbeat-pager` (`bsd/dev/rosemary_beat.c`) — поток,
+   `ROSEMARY MATCH: <сервис> started 0|1` после. Если строка `started`
+   не появилась — встал именно этот драйвер; если не появилась даже пара
+   `<-` — встал сам цикл сопоставления (тогда смотреть 0099: `returned` нет).
+3. `0101-rosemary-boot-heartbeat-pager` (`bsd/dev/rosemary_beat.c`) — поток,
    который раз в секунду печатает точку и раз в 15 тиков строку
    `ROSEMARY BEAT N`, а через 40 с начинает выкладывать на экран кольцо
    консоли (4 МиБ, кормится из `_cnputs`): 60–75 строк на страницу,
@@ -1777,9 +1779,10 @@ unlocked)` и останавливается; маркеры `bsd_init`/`IOKitBS
    байта и по кругу. Страницы фотографируются и читаются оффлайн.
    Boot-args: `rosemarybeat=`, `rosemarypage=40`, `rosemarypageevery=20`
    (`rosemarypageevery=0` — только пульс, без страниц).
-3. `0098-rosemary-log-ring-readers` — `rosemary_log_position()` /
-   `rosemary_log_copy()`: чтение кольца без блокировок (страницы может писать
-   другой CPU, пока bootstrap-поток стоит).
+4. `0098-rosemary-log-ring-readers` — `rosemary_bootlog_position()` /
+   `rosemary_bootlog_copy()`: чтение кольца без блокировок (страницы может
+   писать другой CPU, пока bootstrap-поток стоит) плюс флаг
+   `rosemary_log_pause`, чтобы пагер не переписывал собственный вывод.
 
 **Как читать экран.**
 

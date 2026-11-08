@@ -185,3 +185,25 @@ index 0000000..b5f84f8
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_ROSEMARY */
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 04dda53..717589a 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -379,6 +379,17 @@ PE_lockdown_iokit(void)
+ 	 * hardware protections.
+ 	 */
+ 	zalloc_iokit_lockdown();
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++	/*
++	 * The heartbeat comes up before IOKit matching, which is where the boot
++	 * stops today (the last console line is AppleKeyStore registering).
++	 * From here on a thread prints a dot every second and pages the console
++	 * ring to the panel once the boot is clearly stuck, so a hang is visible
++	 * without a serial port. bsd/dev/rosemary_beat.c
++	 */
++	extern void rosemary_beat_start(void);
++	rosemary_beat_start();
++#endif
+ 	StartIOKitMatching();
+ }
+ 

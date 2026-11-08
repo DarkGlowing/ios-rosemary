@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d74c063..b10a773 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -181,11 +181,22 @@ void
+ StartIOKitMatching(void)
+ {
+ 	SOCD_TRACE_XNU(START_IOKIT);
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++	/*
++	 * The boot currently stops inside this sweep, so both ends of it are
++	 * printed: without the closing line the hang is in the matching of
++	 * gIOKernelConfigTables, not before and not after it.
++	 */
++	IOLog("ROSEMARY IOKIT: StartIOKitMatching enter\n");
++#endif
+ 	assert(gRootNub != NULL);
+ 	bool ok = gRootNub->startIOServiceMatching();
+ 	if (__improbable(!ok)) {
+ 		panic("Failed to start IOService matching");
+ 	}
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++	IOLog("ROSEMARY IOKIT: StartIOKitMatching returned\n");
++#endif
+ 
+ #if !NO_KEXTD
+ 	if (OSKext::iokitDaemonAvailable()) {
