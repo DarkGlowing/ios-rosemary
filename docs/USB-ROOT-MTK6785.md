@@ -1843,3 +1843,36 @@ zone_init: map GEN0…DATA…, VM bootstrap done, IOKit IOMD setownership ENABLE
 `0x1971`) раз в тик с печатью `ROSEMARY WDT: mode= length=`, печать фазы
 `ROSEMARY PHASE: <имя>` на каждом переходе startup-подсистемы и правило «точка
 только если консоль молчала весь тик».
+
+### 7.42.2 Почему был «Invalid ticket lock» (k26, 2026-11-08)
+
+Паника на экране:
+
+```
+ROSEMARY EARLY PANIC: Invalid ticket lock 0xfffffe0007b8c4c8 @ lock_ticket.c:134
+esr=0 far=0 elr=0 spsr=0
+```
+
+Адрес `0xfffffe0007b8c4c8` в `kernel.development.rosemary` (k26) — это
+`_log_lock` из `osfmk/kern/printf.c`. Значит, дело не в USB и не в watchdog:
+`kprintf` вызвали до того, как его собственная блокировка была инициализирована.
+
+Причина — в патче 0104: `kernel_startup_log()` вызывается и для
+`STARTUP_SUB_TUNABLES`, `_TIMEOUTS`, `_LOCKS`, а `STARTUP_SUB_LOCKS` идёт
+**раньше** `STARTUP_SUB_KPRINTF` (2 < 3). Печать фазы внутри этой функции
+на старте трогала `log_lock` до `lck_ticket_init()` → паника.
+
+Второй дефект того же патча, который ждал своей очереди: маркеры
+`ROSEMARY BOOT` стояли до `spllo()`, а `console_io_allowed()` при выключенных
+прерываниях и `startup_phase >= STARTUP_SUB_EARLY_BOOT` делает
+`panic("Console I/O from interrupt-disabled context")`.
+
+Оба исправлены в 0104:
+
+- печать фазы только при `subsystem >= STARTUP_SUB_KPRINTF` и внутри таблицы
+  имён (LOCKDOWN = `~0u` в таблицу не попадает);
+- убраны маркеры до `spllo()`; первый теперь `interrupts enabled`, дальше
+  `acquiring screen` / `screen acquired` / `commpage init start|done` /
+  `lockdown phase start|done` / `machine_lockdown start|done` /
+  `calling bsd_init`. Так видно ровно то, что нужно: `screen acquired` без
+  следующей строки = встали в `initialize_screen()`.

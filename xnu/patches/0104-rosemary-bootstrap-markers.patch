@@ -1,28 +1,38 @@
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
-index bec97fb..205c483 100644
+index bec97fb..162bc39 100644
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
-@@ -376,6 +376,19 @@ kernel_startup_log(startup_subsystem_id_t subsystem)
+@@ -376,6 +376,29 @@ kernel_startup_log(startup_subsystem_id_t subsystem)
  	}
  
  	if (subsystem < sizeof(names) / sizeof(names[0]) && names[subsystem]) {
 +#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
-+		/* One line per subsystem: the boot dies in one of them and prints no
-+		 * panic. rosemaryphase=0 turns it off. */
++		/*
++		 * One line per subsystem: the boot dies in one of them and prints no
++		 * panic. rosemaryphase=0 turns it off.
++		 *
++		 * Only after STARTUP_SUB_KPRINTF: this function runs for
++		 * STARTUP_SUB_TUNABLES, _TIMEOUTS and _LOCKS first, and kprintf takes
++		 * the ticket lock log_lock (osfmk/kern/printf.c), which the
++		 * STARTUP_SUB_LOCKS entries initialise. Printing before that panics
++		 * with "Invalid ticket lock ... @lock_ticket.c:134" pointing at
++		 * _log_lock, which is exactly what kernel k26 did.
++		 */
 +		static int rosemary_phase = -1;
 +		if (rosemary_phase < 0) {
 +			rosemary_phase = 1;
 +			(void)PE_parse_boot_argn("rosemaryphase", &rosemary_phase,
 +			    sizeof(rosemary_phase));
 +		}
-+		if (rosemary_phase) {
++		if (rosemary_phase && subsystem >= STARTUP_SUB_KPRINTF &&
++		    subsystem < sizeof(names) / sizeof(names[0])) {
 +			kprintf("ROSEMARY PHASE: %s\n", names[subsystem]);
 +		}
 +#endif
  		kernel_bootstrap_log(names[subsystem]);
  	}
  	logged = subsystem;
-@@ -419,6 +432,12 @@ kernel_startup_initialize_upto(startup_subsystem_id_t upto)
+@@ -419,6 +442,12 @@ kernel_startup_initialize_upto(startup_subsystem_id_t upto)
  	startup_phase = upto;
  }
  
@@ -35,22 +45,7 @@ index bec97fb..205c483 100644
  void
  kernel_bootstrap(void)
  {
-@@ -690,29 +709,37 @@ kernel_bootstrap_thread(void)
- #endif
- 
- 	assert(ml_get_interrupts_enabled() == FALSE);
-+	ROSEMARY_BOOT_MARK("iokit matching done, interrupts off");
- 
- 	/*
- 	 * Past this point, kernel subsystems that expect to operate with
- 	 * interrupts or preemption enabled may begin enforcement.
- 	 */
-+	ROSEMARY_BOOT_MARK("early_boot phase start");
- 	kernel_startup_initialize_upto(STARTUP_SUB_EARLY_BOOT);
-+	ROSEMARY_BOOT_MARK("early_boot phase done");
- 
- #if SCHED_HYGIENE_DEBUG
- 	// Reset interrupts masked timeout before we enable interrupts
+@@ -702,17 +731,22 @@ kernel_bootstrap_thread(void)
  	ml_spin_debug_clear_self();
  #endif
  	(void) spllo();         /* Allow interruptions */
@@ -73,7 +68,7 @@ index bec97fb..205c483 100644
  
  #if CONFIG_MACF
  	kernel_bootstrap_log("mac_policy_initmach");
-@@ -744,7 +771,9 @@ kernel_bootstrap_thread(void)
+@@ -744,7 +778,9 @@ kernel_bootstrap_thread(void)
  	load_static_trust_cache();
  #endif
  
@@ -83,7 +78,7 @@ index bec97fb..205c483 100644
  
  	/*
  	 * Get rid of segments used to bootstrap kext loading. This removes
-@@ -757,7 +786,9 @@ kernel_bootstrap_thread(void)
+@@ -757,7 +793,9 @@ kernel_bootstrap_thread(void)
  
  	/* No changes to kernel text and rodata beyond this point. */
  	kernel_bootstrap_log("machine_lockdown");
@@ -93,7 +88,7 @@ index bec97fb..205c483 100644
  
  #ifdef CONFIG_XNUPOST
  	kern_return_t result = kernel_list_tests();
-@@ -787,7 +818,9 @@ kernel_bootstrap_thread(void)
+@@ -787,7 +825,9 @@ kernel_bootstrap_thread(void)
  	 *	Start the user bootstrap.
  	 */
  #ifdef  MACH_BSD
