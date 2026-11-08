@@ -12,7 +12,7 @@ index 9b6ccdb..6340d27 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/rosemary_beat.c b/bsd/dev/rosemary_beat.c
 new file mode 100644
-index 0000000..f88975a
+index 0000000..1a95609
 --- /dev/null
 +++ b/bsd/dev/rosemary_beat.c
 @@ -0,0 +1,240 @@
@@ -81,12 +81,14 @@ index 0000000..f88975a
 +#define ROSEMARY_WDT_RESTART   0x08
 +#define ROSEMARY_WDT_KEY       0x1971u
 +
-+static volatile uint8_t *rosemary_wdt;
++/* Same style as bsd/dev/rosemary_ufs.c: a mapped address kept as an integer,
++ * each register touched through an explicit cast. */
++static vm_offset_t rosemary_wdt;
 +
 +static void
 +rosemary_wdt_pet(void)
 +{
-+	if (rosemary_wdt != NULL) {
++	if (rosemary_wdt != 0) {
 +		*(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_RESTART) =
 +		    (ROSEMARY_WDT_KEY << 16) | 0x19;
 +		__asm__ volatile("dsb sy" ::: "memory");
@@ -96,8 +98,7 @@ index 0000000..f88975a
 +static uint32_t
 +rosemary_wdt_rd(uint32_t off)
 +{
-+	return rosemary_wdt != NULL ?
-+	       *(volatile uint32_t *)(rosemary_wdt + off) : 0;
++	return rosemary_wdt != 0 ? *(volatile uint32_t *)(rosemary_wdt + off) : 0;
 +}
 +
 +void rosemary_beat_start(void);
@@ -119,55 +120,55 @@ index 0000000..f88975a
 +static void
 +rosemary_page(void)
 +{
-+	static char page[8192];
-+	uint64_t total = rosemary_bootlog_position();
-+	uint64_t oldest = total > ROSEMARY_LOG_RING ? total - ROSEMARY_LOG_RING : 0;
++	static char pg[8192];
++	uint64_t log_total = rosemary_bootlog_position();
++	uint64_t log_oldest = log_total > ROSEMARY_LOG_RING ? log_total - ROSEMARY_LOG_RING : 0;
 +
-+	if (rosemary_page_bytes + 64 > sizeof(page)) {
-+		rosemary_page_bytes = (uint32_t)(sizeof(page) - 64);
++	if (rosemary_page_bytes + 64 > sizeof(pg)) {
++		rosemary_page_bytes = (uint32_t)(sizeof(pg) - 64);
 +	}
-+	if (rosemary_page_end == 0 || rosemary_page_end > total) {
-+		rosemary_page_end = total;
++	if (rosemary_page_end == 0 || rosemary_page_end > log_total) {
++		rosemary_page_end = log_total;
 +	}
-+	uint64_t end = rosemary_page_end;
-+	if (end <= oldest || total == 0) {
++	uint64_t page_end_pos = rosemary_page_end;
++	if (page_end_pos <= log_oldest || log_total == 0) {
 +		/* A whole pass is done (or nothing was logged yet): start from the tail. */
-+		rosemary_page_end = total;
++		rosemary_page_end = log_total;
 +		return;
 +	}
-+	uint64_t begin = end > rosemary_page_bytes ? end - rosemary_page_bytes : 0;
++	uint64_t page_begin = page_end_pos > rosemary_page_bytes ? page_end_pos - rosemary_page_bytes : 0;
 +
-+	if (begin < oldest) {
-+		begin = oldest;
++	if (page_begin < log_oldest) {
++		page_begin = log_oldest;
 +	}
 +
-+	uint64_t pos = begin;
++	uint64_t pos = page_begin;
 +	uint32_t n = 0;
 +
-+	while (n + 1 < sizeof(page)) {
-+		uint32_t k = rosemary_bootlog_copy(&pos, page + n,
-+		    (uint32_t)(sizeof(page) - 1 - n));
++	while (n + 1 < sizeof(pg)) {
++		uint32_t k = rosemary_bootlog_copy(&pos, pg + n,
++		    (uint32_t)(sizeof(pg) - 1 - n));
 +		if (k == 0) {
 +			break;
 +		}
 +		n += k;
 +	}
-+	page[n] = 0;
++	pg[n] = 0;
 +
 +	/* A page must start and end on a line boundary to be readable. */
 +	rosemary_log_pause = 1;
-+	printf("\nROSEMARY LOGPAGE: bytes %llu..%llu of %llu\n", begin, pos, total);
-+	printf("%s", page);
-+	printf("\nROSEMARY LOGPAGE: end (bytes %llu..%llu)\n", begin, pos);
++	printf("\nROSEMARY LOGPAGE: bytes %llu..%llu of %llu\n", page_begin, pos, log_total);
++	printf("%s", pg);
++	printf("\nROSEMARY LOGPAGE: end (bytes %llu..%llu)\n", page_begin, pos);
 +	rosemary_log_pause = 0;
-+	rosemary_page_end = begin;
++	rosemary_page_end = page_begin;
 +}
 +
 +static void
 +rosemary_beat_thread(__unused void *arg, __unused wait_result_t wr)
 +{
 +	uint32_t until_page = rosemary_page_from;
-+	int page = 0;
++	uint32_t page_no = 0;
 +	uint64_t last_total = rosemary_bootlog_position();
 +
 +	printf("ROSEMARY BEAT: start (tick %us, first page after %us, then every %us)\n",
@@ -186,15 +187,15 @@ index 0000000..f88975a
 +		 * console has been silent for a whole tick, which is exactly the
 +		 * question dots exist to answer.
 +		 */
-+		uint64_t total = rosemary_bootlog_position();
-+		if (total == last_total) {
++		uint64_t log_total = rosemary_bootlog_position();
++		if (log_total == last_total) {
 +			if ((rosemary_beat_count % rosemary_beat_line) == 0) {
 +				printf("ROSEMARY BEAT %u\n", rosemary_beat_count);
 +			} else {
 +				printf(".");
 +			}
 +		}
-+		last_total = total;
++		last_total = log_total;
 +
 +		if (rosemary_page_every == 0) {
 +			continue;
@@ -204,8 +205,8 @@ index 0000000..f88975a
 +			continue;
 +		}
 +		/* Page the log, then give the reader time to photograph it. */
-+		page++;
-+		printf("ROSEMARY LOGPAGE: page %d\n", page);
++		page_no++;
++		printf("ROSEMARY LOGPAGE: page %u\n", page_no);
 +		rosemary_page();
 +		until_page = rosemary_page_every;
 +	}
@@ -233,9 +234,8 @@ index 0000000..f88975a
 +		int pet = 1;
 +		(void)PE_parse_boot_argn("rosemarywdt", &pet, sizeof(pet));
 +		if (pet) {
-+			rosemary_wdt = (volatile uint8_t *)ml_io_map(ROSEMARY_WDT_PA,
-+			    ROSEMARY_WDT_SIZE);
-+			if (rosemary_wdt != NULL) {
++			rosemary_wdt = ml_io_map(ROSEMARY_WDT_PA, ROSEMARY_WDT_SIZE);
++			if (rosemary_wdt != 0) {
 +				printf("ROSEMARY WDT: mode=0x%x length=0x%x, petting every %us\n",
 +				    rosemary_wdt_rd(ROSEMARY_WDT_MODE),
 +				    rosemary_wdt_rd(ROSEMARY_WDT_LENGTH),

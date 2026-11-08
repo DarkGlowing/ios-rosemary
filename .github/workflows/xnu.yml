@@ -97,6 +97,28 @@ jobs:
           restore-keys: |
             buildobj-v3-${{ env.MACHINE_CONFIG }}-
 
+      - name: Drop cached objects of every source a patch rewrites
+        # A patched file whose compile fails under `make -k` keeps the object
+        # from the cache and the link still produces a kernel, which then
+        # contains the old code while the sources say otherwise. Deleting just
+        # those objects forces a real compile (and a real failure) for them,
+        # without paying for a full rebuild of everything.
+        run: |
+          set -eu
+          files=$(for p in xnu/patches/*.patch; do
+                    git apply --numstat "$p" 2>/dev/null | awk '{print $3}'
+                  done | sort -u)
+          n=0
+          for f in $files; do
+            case "$f" in *.c|*.cpp|*.h) ;; *) continue ;; esac
+            base=$(basename "$f")
+            obj="${base%.*}.o"
+            while IFS= read -r o; do
+              rm -f "$o" && n=$((n + 1))
+            done < <(find dxb/build -name "$obj" 2>/dev/null || true)
+          done
+          echo "dropped $n cached objects for patched sources"
+
       - name: Force full rebuild (defeat stale objects)
         # Full rebuild is opt-in: set the full_rebuild input when a stale
         # object could hide a patch. Normal runs reuse cached objects.
@@ -217,11 +239,16 @@ jobs:
           ls -l dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || echo "rosemary_beat.c MISSING (0101 skipped)"
           grep -n 'rosemary_beat.c' dxb/xnu/bsd/conf/files 2>&1 || echo "conf/files entry MISSING"
           echo "=== compile errors that could explain a stale object (-k keeps going) ==="
-          grep -nE 'error:' dxb/build.log 2>/dev/null | grep -E 'IOService\.cpp|pe_init\.c|rosemary_beat\.c|rosemary_ufs\.c' | head -30 || true
+          grep -nE 'error:' dxb/build.log 2>/dev/null | grep -E 'IOService\.cpp|IOStartIOKit\.cpp|pe_init\.c|rosemary_beat\.c|rosemary_ufs\.c' > ours.txt || true
+          cat ours.txt 2>/dev/null || true
           echo "=== all errors (first 20) ==="
           grep -nE 'error:' dxb/build.log 2>/dev/null | head -20 || true
           echo "=== applied / skipped patches ==="
           grep -E 'Applying patch|Skipping patch' dxb/build.log 2>/dev/null | tail -40 || true
+          if [ -s ours.txt ]; then
+            echo "FAIL: a file our patches own did not compile, so the kernel was linked with a cached object and does not contain the new code."
+            exit 1
+          fi
 
       - name: Verify the patched source really has the diag
         if: always()
