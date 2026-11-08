@@ -77,7 +77,18 @@ jobs:
           echo "--- KDKs present (build.sh downloads the 13.5 one if missing) ---"
           ls -1 /Library/Developer/KDKs 2>/dev/null || echo "none"
 
+      - name: Restore XNU build objects
+        uses: actions/cache@v4
+        with:
+          path: dxb/build
+          key: buildobj-${{ env.MACHINE_CONFIG }}-${{ github.sha }}
+          restore-keys: |
+            buildobj-${{ env.MACHINE_CONFIG }}-
+
       - name: Force full rebuild (defeat stale objects)
+        # Full rebuild is opt-in: set the full_rebuild input when a stale
+        # object could hide a patch. Normal runs reuse cached objects.
+        if: inputs.full_rebuild == true
         run: |
           # The build tree may carry objects whose timestamps beat the patched
           # sources; touch everything so every patched file is recompiled.
