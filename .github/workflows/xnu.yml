@@ -210,6 +210,10 @@ jobs:
             || { echo 'ERROR: bsd_init trace missing'; exit 1; }
           grep -F 'ROSEMARY root: IOKitBSDInit reached' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp \
             || { echo 'ERROR: root marker missing'; exit 1; }
+          grep -F 'PE_parse_boot_argn("no_aks"' dxb/xnu/iokit/Kernel/arm/RosemaryKeyStore.cpp \
+            || { echo 'ERROR: AKS toggle no_aks was not applied'; exit 1; }
+          grep -F 'registration skipped by no_aks' dxb/xnu/iokit/Kernel/arm/RosemaryKeyStore.cpp \
+            || { echo 'ERROR: AKS skip marker missing'; exit 1; }
           grep -F 'rosemary_usbmsc_rootdev(root)' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp
           mkdir -p out
           found=0
