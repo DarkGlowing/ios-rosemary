@@ -17,7 +17,6 @@
 #include <pexpert/pexpert.h>
 #include <libkern/libkern.h>
 
-#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
 /* Private ARM APIs are not declared by the BSD exported headers.
  * Same declarations as the existing rosemary_ufs driver. */
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -563,4 +562,4 @@ out:
  }
  lck_mtx_unlock(&usbmsc_lock);return err;
 }
-#endif
+

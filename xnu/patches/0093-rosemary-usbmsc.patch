@@ -9,8 +9,36 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -784,6 +784,21 @@
+ 	}
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++	if (strcmp(rdBootVar, "usbroot0") == 0) {
++		extern int rosemary_usbmsc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int usb_error = rosemary_usbmsc_rootdev(root);
++		if (usb_error) {
++			panic("IOFindBSDRoot: usbroot0 unavailable: %d", usb_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ //
+ //	Now check if we are trying to root on a memory device
+ //
 diff --git a/bsd/dev/rosemary_usbmsc.c b/bsd/dev/rosemary_usbmsc.c
 new file mode 100644
+--- /dev/null
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -0,0 +1,565 @@
 +/* MT6785 USB BOT root, polled and read-only. No USB hubs/UAS/hotplug.
 + * Hardware sequence derived from shim/usb.c; native XNU port needs HW testing.
 + * DMA addresses are physical 64-bit addresses, never kernel virtual pointers.
@@ -30,7 +58,6 @@ new file mode 100644
 +#include <pexpert/pexpert.h>
 +#include <libkern/libkern.h>
 +
-+#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
 +/* Private ARM APIs are not declared by the BSD exported headers.
 + * Same declarations as the existing rosemary_ufs driver. */
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -576,86 +603,4 @@ new file mode 100644
 + }
 + lck_mtx_unlock(&usbmsc_lock);return err;
 +}
-+#endif
-diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
---- a/bsd/kern/bsd_init.c
-+++ b/bsd/kern/bsd_init.c
-@@ -487,10 +487,12 @@
- #endif
- 
- #if (DEVELOPMENT || DEBUG)
-+#if !defined(ARM64_BOARD_CONFIG_ROSEMARY)
- 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
- #endif
--
--#define DEBUG_BSDINIT 0
-+#endif
 +
-+#define DEBUG_BSDINIT 1
- 
- #if DEBUG_BSDINIT
- #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -498,6 +500,7 @@
- #define bsd_init_kprintf(x, ...)
- #endif
- 
-+	kprintf("ROSEMARY bsd_init: entered\n");
- 	throttle_init();
- 
- 	printf(copyright);
-@@ -798,7 +801,9 @@
- 	sysctl_mib_init();
- 
- 	bsd_init_kprintf("calling bsd_autoconf\n");
-+	kprintf("ROSEMARY bsd_init: before bsd_autoconf\n");
- 	bsd_autoconf();
-+	kprintf("ROSEMARY bsd_init: after bsd_autoconf\n");
- 
- #if CONFIG_DTRACE
- 	dtrace_postinit();
-@@ -1105,6 +1110,7 @@
- kern_return_t
- bsd_autoconf(void)
- {
-+	kprintf("ROSEMARY bsd_autoconf: entered\n");
- 	kprintf("bsd_autoconf: calling kminit\n");
- 	kminit();
- 
-diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
---- a/iokit/bsddev/IOKitBSDInit.cpp
-+++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -109,6 +109,7 @@
- kern_return_t
- IOKitBSDInit( void )
- {
-+	kprintf("ROSEMARY IOKitBSDInit: entered\n");
- 	IOService::publishResource("IOBSD");
- 
- #if IOPOLLED_COREFILE
-@@ -784,7 +785,26 @@
- 	}
- #endif
- 
-+#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
-+	if (strcmp(rdBootVar, "usbroot0") == 0) {
-+		extern int rosemary_usbmsc_rootdev(dev_t *dev);
-+		OSSafeReleaseNULL(matching);
-+		int usb_error = rosemary_usbmsc_rootdev(root);
-+		if (usb_error) {
-+			panic("IOFindBSDRoot: usbroot0 unavailable: %d", usb_error);
-+		}
-+		strlcpy(rootName, rdBootVar, rootNameSize);
-+		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
-+		*oflags = 0;
-+		goto iofrootx;
-+	}
-+#endif
-+
- //
-+#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
-+	printf("ROSEMARY root: IOKitBSDInit reached, rd='%s'\n", rdBootVar);
-+#endif
-+
- //	Now check if we are trying to root on a memory device
- //
- 
