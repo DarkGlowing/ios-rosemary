@@ -1,0 +1,28 @@
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index bec97fb..8322010 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -376,6 +376,23 @@ kernel_startup_log(startup_subsystem_id_t subsystem)
+ 	}
+ 
+ 	if (subsystem < sizeof(names) / sizeof(names[0]) && names[subsystem]) {
++#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++		/*
++		 * The boot dies somewhere in this sequence without printing a panic,
++		 * so each subsystem is announced on the console. One line per
++		 * subsystem (about sixteen), negligible next to the boot itself.
++		 * rosemaryphase=0 turns it off.
++		 */
++		static int rosemary_phase = -1;
++		if (rosemary_phase < 0) {
++			rosemary_phase = 1;
++			(void)PE_parse_boot_argn("rosemaryphase", &rosemary_phase,
++			    sizeof(rosemary_phase));
++		}
++		if (rosemary_phase) {
++			kprintf("ROSEMARY PHASE: %s\n", names[subsystem]);
++		}
++#endif
+ 		kernel_bootstrap_log(names[subsystem]);
+ 	}
+ 	logged = subsystem;

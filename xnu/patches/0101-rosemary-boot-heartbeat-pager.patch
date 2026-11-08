@@ -12,10 +12,10 @@ index 9b6ccdb..6340d27 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/rosemary_beat.c b/bsd/dev/rosemary_beat.c
 new file mode 100644
-index 0000000..b5f84f8
+index 0000000..f88975a
 --- /dev/null
 +++ b/bsd/dev/rosemary_beat.c
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,240 @@
 +/*
 + * ROSEMARY boot heartbeat and boot-log pager.
 + *
@@ -52,6 +52,7 @@ index 0000000..b5f84f8
 +
 +/* Not exported to the BSD layer by the headers above. */
 +extern int hz;
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +extern void thread_deallocate(thread_t);
 +
@@ -65,13 +66,47 @@ index 0000000..b5f84f8
 + * record its own output into the ring it is reading from. */
 +extern int rosemary_log_pause;
 +
++/*
++ * MTK top RGU watchdog (shim/platform_mt6785.h). The shim clears its EN bit
++ * before the jump, but the boot still ends in a reset about 25-30 s into XNU
++ * with no panic on the console, which is what an armed watchdog looks like:
++ * either another instance or LK re-arming this one. Petting it from the beat
++ * thread takes that timer out of the experiment; the mode/length registers are
++ * printed once so the log says what was actually armed.
++ */
++#define ROSEMARY_WDT_PA        0x10007000UL
++#define ROSEMARY_WDT_SIZE      0x1000
++#define ROSEMARY_WDT_MODE      0x00
++#define ROSEMARY_WDT_LENGTH    0x04
++#define ROSEMARY_WDT_RESTART   0x08
++#define ROSEMARY_WDT_KEY       0x1971u
++
++static volatile uint8_t *rosemary_wdt;
++
++static void
++rosemary_wdt_pet(void)
++{
++	if (rosemary_wdt != NULL) {
++		*(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_RESTART) =
++		    (ROSEMARY_WDT_KEY << 16) | 0x19;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++static uint32_t
++rosemary_wdt_rd(uint32_t off)
++{
++	return rosemary_wdt != NULL ?
++	       *(volatile uint32_t *)(rosemary_wdt + off) : 0;
++}
++
 +void rosemary_beat_start(void);
 +
 +static uint32_t rosemary_beat_secs = 1;
 +static uint32_t rosemary_beat_line = 15;        /* full line every N ticks */
-+static uint32_t rosemary_page_from = 40;        /* first page, seconds */
-+static uint32_t rosemary_page_every = 20;       /* next pages, seconds */
-+static uint32_t rosemary_page_bytes = 6000;     /* ~75 lines of 80 chars */
++static uint32_t rosemary_page_from = 25;        /* first page, seconds */
++static uint32_t rosemary_page_every = 15;       /* next pages, seconds */
++static uint32_t rosemary_page_bytes = 4500;     /* ~75 lines of 80 chars */
 +static int rosemary_beat_chan;
 +
 +static uint32_t rosemary_beat_count;
@@ -133,6 +168,7 @@ index 0000000..b5f84f8
 +{
 +	uint32_t until_page = rosemary_page_from;
 +	int page = 0;
++	uint64_t last_total = rosemary_bootlog_position();
 +
 +	printf("ROSEMARY BEAT: start (tick %us, first page after %us, then every %us)\n",
 +	    rosemary_beat_secs, rosemary_page_from, rosemary_page_every);
@@ -140,11 +176,26 @@ index 0000000..b5f84f8
 +		(void)tsleep(&rosemary_beat_chan, PZERO, "rosemarybt",
 +		    hz * (int)rosemary_beat_secs);
 +		rosemary_beat_count++;
-+		if ((rosemary_beat_count % rosemary_beat_line) == 0) {
-+			printf("ROSEMARY BEAT %u\n", rosemary_beat_count);
-+		} else {
-+			printf(".");
++		rosemary_wdt_pet();
++
++		/*
++		 * Never interleave with the boot's own output: writing a dot from
++		 * this thread while the bootstrap thread is in the middle of a
++		 * kprintf drops characters from both (the first run lost the start
++		 * of a console line this way). A dot is printed only when the
++		 * console has been silent for a whole tick, which is exactly the
++		 * question dots exist to answer.
++		 */
++		uint64_t total = rosemary_bootlog_position();
++		if (total == last_total) {
++			if ((rosemary_beat_count % rosemary_beat_line) == 0) {
++				printf("ROSEMARY BEAT %u\n", rosemary_beat_count);
++			} else {
++				printf(".");
++			}
 +		}
++		last_total = total;
++
 +		if (rosemary_page_every == 0) {
 +			continue;
 +		}
@@ -177,6 +228,26 @@ index 0000000..b5f84f8
 +
 +	/* Paging must be visible even when AppleCLCD muted the console for the GUI. */
 +	rosemary_console_muted = 0;
++
++	{
++		int pet = 1;
++		(void)PE_parse_boot_argn("rosemarywdt", &pet, sizeof(pet));
++		if (pet) {
++			rosemary_wdt = (volatile uint8_t *)ml_io_map(ROSEMARY_WDT_PA,
++			    ROSEMARY_WDT_SIZE);
++			if (rosemary_wdt != NULL) {
++				printf("ROSEMARY WDT: mode=0x%x length=0x%x, petting every %us\n",
++				    rosemary_wdt_rd(ROSEMARY_WDT_MODE),
++				    rosemary_wdt_rd(ROSEMARY_WDT_LENGTH),
++				    rosemary_beat_secs);
++				rosemary_wdt_pet();
++			} else {
++				printf("ROSEMARY WDT: map failed, not petting\n");
++			}
++		} else {
++			printf("ROSEMARY WDT: petting disabled by boot-arg\n");
++		}
++	}
 +
 +	if (kernel_thread_start(rosemary_beat_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);

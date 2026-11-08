@@ -207,12 +207,13 @@ jobs:
         run: |
           set -uo pipefail
           echo "=== patches handed to the build ==="
-          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* xnu/patches/0101* || echo "MISSING FROM REPO"
-          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* dxb/patches/0101* || echo "MISSING FROM dxb/patches"
+          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* xnu/patches/0101* xnu/patches/0102* || echo "MISSING FROM REPO"
+          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* dxb/patches/0101* dxb/patches/0102* || echo "MISSING FROM dxb/patches"
           echo "=== did the patches reach the sources? (dxb/xnu is patched by build.sh) ==="
           grep -c 'StartIOKitMatching enter' dxb/xnu/iokit/Kernel/IOStartIOKit.cpp 2>&1 || true
           grep -c 'ROSEMARY MATCH' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
           grep -c 'rosemary_beat_start' dxb/xnu/pexpert/arm/pe_init.c 2>&1 || true
+          grep -c 'ROSEMARY PHASE' dxb/xnu/osfmk/kern/startup.c 2>&1 || true
           grep -c 'rosemary_bootlog_copy' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
           ls -l dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || echo "rosemary_beat.c MISSING (0101 skipped)"
           grep -n 'rosemary_beat.c' dxb/xnu/bsd/conf/files 2>&1 || echo "conf/files entry MISSING"
@@ -351,6 +352,10 @@ jobs:
             echo 'ERROR: log pager patch 0101 missing from kernel'; exit 1; }
           strings out/kernel.development.rosemary | grep -F 'StartIOKitMatching enter' >/dev/null || {
             echo 'ERROR: IOKit sweep marker patch 0099 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY PHASE:' >/dev/null || {
+            echo 'ERROR: startup phase markers patch 0102 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY WDT: mode=' >/dev/null || {
+            echo 'ERROR: watchdog petting patch 0101 missing from kernel'; exit 1; }
           (cd out && shasum -a 256 kernel.development.rosemary > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
