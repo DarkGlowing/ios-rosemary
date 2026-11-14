@@ -1,13 +1,13 @@
 --- a/iokit/Kernel/arm/RosemaryKeyStore.cpp
 +++ b/iokit/Kernel/arm/RosemaryKeyStore.cpp
 @@ -113,6 +113,7 @@
- 		setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
  		registerService();
  		IOLog("ROSEMARY AKS: AppleKeyStore registered (no passcode, unlocked)\n");
 +		ROSEMARY_BOOT_MARK("AppleKeyStore exit");
  		return true;
  	}
  }
+
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
 @@ -817,7 +817,9 @@
