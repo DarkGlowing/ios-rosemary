@@ -1,0 +1,10 @@
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -819,6 +819,7 @@
+ 	ROSEMARY_BOOT_MARK("vm_set_restrictions start");
+ 	vm_set_restrictions(machine_info.max_cpus);
+ 	ROSEMARY_BOOT_MARK("vm_set_restrictions done");
++	ROSEMARY_BOOT_MARK("vm restrictions applied");
+ 
+ #if KPERF
+ 	/*
