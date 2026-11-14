@@ -1,0 +1,18 @@
+--- a/iokit/Kernel/arm/RosemaryKeyStore.cpp
++++ b/iokit/Kernel/arm/RosemaryKeyStore.cpp
+@@ -113,6 +113,7 @@
+ 		setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 		registerService();
+ 		IOLog("ROSEMARY AKS: AppleKeyStore registered (no passcode, unlocked)\n");
++		ROSEMARY_BOOT_MARK("AppleKeyStore exit");
+ 		return true;
+ 	}
+ }
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -817,7 +817,9 @@
+ 	ROSEMARY_BOOT_MARK("vm_set_restrictions start");
+ 	vm_set_restrictions(machine_info.max_cpus);
+ 	ROSEMARY_BOOT_MARK("vm_set_restrictions done");
++	ROSEMARY_BOOT_MARK("post-vm-setup");
+ }
