@@ -1,0 +1,58 @@
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -308,7 +308,11 @@
+ 		return error;
+ 	}
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+-		printf("ROSEMARY UFS: LUN %u has no GPT\n", su.lun);
++		printf("ROSEMARY UFS: LUN %u has no GPT; first 16 bytes:", su.lun);
++		for (int i = 0; i < 16; i++) {
++			printf(" %02x", b[i]);
++		}
++		printf("\n");
+ 		return ENXIO;
+ 	}
+ 	uint64_t entry_lba;
+@@ -825,6 +829,16 @@
+ 	su.dma_pa = ptoa_64(pn);
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
++	/*
++	 * The normal init path takes these from boot args, and the log
++	 * cmdline does not carry them. They must be on here: the host is
++	 * not cache coherent, so without a clean or invalidate around
++	 * each command the CPU can read back the lines that were zeroed
++	 * at allocation and see zeros instead of what the device wrote.
++	 * That is what made the GPT look absent.
++	 */
++	su.cache = true;
++	su.wait = true;
+ 
+ 	lck_mtx_lock(&rosemary_ufs_lock);
+ 	error = ufs_take_over_host();
+@@ -866,7 +880,25 @@
+ 	 * this late loses nothing.
+ 	 */
+ 	(void)tsleep(&rosemary_log_chan, PZERO, "rosemarylogw", hz * 3);
++	/*
++	 * Explicit partition range, skipping the GPT parse. For when the
++	 * GPT read is unreliable but the numbers are known (dump/gpt.bin):
++	 *   ufslogrba=2842624 ufslogblocks=28393464
++	 * ufs_write_blocks() still bounds-checks every write against them.
++	 */
++	uint32_t rba = 0, rblocks = 0;
++	(void)PE_parse_boot_argn("ufslogrba", &rba, sizeof(rba));
++	(void)PE_parse_boot_argn("ufslogblocks", &rblocks, sizeof(rblocks));
++
+ 	if (rosemary_ufs_log_bringup() == 0) {
++		if (rba && rblocks) {
++			printf("ROSEMARY LOG: explicit range %u..%u, GPT ignored\n",
++			    rba, rba + rblocks - 1);
++			lck_mtx_lock(&rosemary_ufs_lock);
++			su.first_block = rba;
++			su.nblocks = rblocks;
++			lck_mtx_unlock(&rosemary_ufs_lock);
++		}
+ 		rosemary_log_start();
+ 	} else {
+ 		printf("ROSEMARY LOG: disabled, UFS unavailable\n");
