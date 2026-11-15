@@ -1,0 +1,41 @@
+From: Chatbox <chatbox@chatboxai.com>
+Subject: [PATCH] rosemary: print bsd_init progress with printf so it reaches the log ring
+
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -501,6 +501,7 @@
+ #endif
+ 
+ 	kprintf("ROSEMARY bsd_init: entered\n");
++	printf("ROSEMARY BSD: entered\n");
+ 	throttle_init();
+ 
+ 	printf(copyright);
+@@ -814,7 +815,9 @@
+ 
+ 	bsd_init_kprintf("calling bsd_autoconf\n");
+ 	kprintf("ROSEMARY bsd_init: before bsd_autoconf\n");
++	printf("ROSEMARY BSD: before bsd_autoconf\n");
+ 	bsd_autoconf();
++	printf("ROSEMARY BSD: after bsd_autoconf\n");
+ 	kprintf("ROSEMARY bsd_init: after bsd_autoconf\n");
+ 
+ #if CONFIG_DTRACE
+@@ -1123,6 +1126,7 @@
+ bsd_autoconf(void)
+ {
+ 	kprintf("ROSEMARY bsd_autoconf: entered\n");
++	printf("ROSEMARY BSD: autoconf entered\n");
+ 	kprintf("bsd_autoconf: calling kminit\n");
+ 	kminit();
+ 
+@@ -1149,7 +1153,9 @@
+ 	u_int32_t       flags;
+ 	kern_return_t   err;
+ 
++	printf("ROSEMARY BSD: before IOFindBSDRoot rd=%s\n", rootdevice);
+ 	err = IOFindBSDRoot(rootdevice, sizeof(rootdevice), &rootdev, &flags);
++	printf("ROSEMARY BSD: IOFindBSDRoot err=%d\n", err);
+ 	if (err) {
+ 		printf("setconf: IOFindBSDRoot returned an error (%d);"
+ 		    "setting rootdevice to 'sd0a'.\n", err);     /* XXX DEBUG TEMP */

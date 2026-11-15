@@ -1,0 +1,13 @@
+From: Chatbox <chatbox@chatboxai.com>
+Subject: [PATCH] rosemary: pet the watchdog from the log thread too
+
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -808,6 +808,7 @@
+ 	    ROSEMARY_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+ 	for (;;) {
+ 		(void)tsleep(&rosemary_log_chan, PZERO, "rosemarylog", hz * (int)rosemary_log_secs);
++		rosemary_wdt_pet();
+ 		uint64_t total = os_atomic_load(&rosemary_log_total, relaxed);
+ 		if (total == flushed) {
+ 			continue;

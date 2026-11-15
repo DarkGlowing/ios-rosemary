@@ -482,6 +482,18 @@ jobs:
           # 0115: MT6785 has three UFS LUNs. LUN 0/1 are 4 MiB boot LUNs with no
           # partition table; Android's GPT and userdata are on LUN 2. Reading
           # LUN 0 is what made the GPT look absent.
+          # 0116: bsd_init's own markers use kprintf, which never reached the
+          # ring. These use printf, the path the heartbeat proved works.
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BSD: entered' >/dev/null || {
+            echo 'ERROR: bsd_init trace patch 0116 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BSD: IOFindBSDRoot err=' >/dev/null || {
+            echo 'ERROR: IOFindBSDRoot marker patch 0116 missing'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BSD: before bsd_autoconf' >/dev/null || {
+            echo 'ERROR: autoconf marker patch 0116 missing'; exit 1; }
+          # 0117: the log thread pets the watchdog too, so a silent hang does
+          # not reboot the phone before the ring can be pulled.
+          grep -q 'rosemary_wdt_pet' dxb/xnu/bsd/dev/rosemary_ufs.c || {
+            echo 'ERROR: log-thread pet patch 0117 missing from source'; exit 1; }
           strings out/kernel.development.rosemary | grep -F 'ufslun' >/dev/null || {
             echo 'ERROR: LUN selection patch 0115 missing from kernel'; exit 1; }
           strings out/kernel.development.rosemary | grep -F 'has no GPT; first 16 bytes' >/dev/null || {
