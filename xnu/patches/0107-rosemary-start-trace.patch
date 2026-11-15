@@ -1,0 +1,32 @@
+--- a/iokit/Kernel/arm/RosemaryFramebuffer.cpp
++++ b/iokit/Kernel/arm/RosemaryFramebuffer.cpp
+@@ -203,6 +203,7 @@
+ 	registerService();
+ 	IOLog("ROSEMARY FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("ROSEMARY FB: start exit\n");
+ 	return true;
+ }
+ 
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -4858,7 +4858,9 @@
+ 		clock_get_uptime(&startTime);
+ 	}
+ 
++	IOLog("ROSEMARY START: %s start enter\n", service->getName());
+ 	ok = service->start(this);
++	IOLog("ROSEMARY START: %s start returned %d\n", service->getName(), (int)ok);
+ 
+ 	if (recordTime) {
+ 		clock_get_uptime(&endTime);
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -4893,6 +4893,7 @@
+ 		IOServicePH::matchingEnd(this);
+ 	}
+ 
++	IOLog("ROSEMARY START: %s startCandidate done %d\n", service->getName(), (int)ok);
+ 	return ok;
+ }
+ 

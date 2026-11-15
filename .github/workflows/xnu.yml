@@ -238,8 +238,8 @@ jobs:
         run: |
           set -uo pipefail
           echo "=== patches handed to the build ==="
-          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* xnu/patches/0101* xnu/patches/0103* xnu/patches/0104* xnu/patches/0105* xnu/patches/0106* || echo "MISSING FROM REPO"
-          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* dxb/patches/0101* dxb/patches/0103* dxb/patches/0104* dxb/patches/0105* dxb/patches/0106* || echo "MISSING FROM dxb/patches"
+          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* xnu/patches/0101* xnu/patches/0103* xnu/patches/0104* xnu/patches/0105* xnu/patches/0106* xnu/patches/0107* || echo "MISSING FROM REPO"
+          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* dxb/patches/0101* dxb/patches/0103* dxb/patches/0104* dxb/patches/0105* dxb/patches/0106* dxb/patches/0107* || echo "MISSING FROM dxb/patches"
           echo "=== did the patches reach the sources? (dxb/xnu is patched by build.sh) ==="
           grep -c 'StartIOKitMatching enter' dxb/xnu/iokit/Kernel/IOStartIOKit.cpp 2>&1 || true
           grep -c 'ROSEMARY MATCH' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
@@ -250,6 +250,8 @@ jobs:
           grep -c 'ROSEMARY BOOT' dxb/xnu/osfmk/kern/startup.c 2>&1 || true
           grep -c 'ROSEMARY AKS: start exit' dxb/xnu/iokit/Kernel/arm/RosemaryKeyStore.cpp 2>&1 || true
           grep -c 'vm restrictions applied' dxb/xnu/osfmk/kern/startup.c 2>&1 || true
+          grep -c 'ROSEMARY START: %s start enter' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
+          grep -c 'ROSEMARY FB: start exit' dxb/xnu/iokit/Kernel/arm/RosemaryFramebuffer.cpp 2>&1 || true
           ls -l dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || echo "rosemary_beat.c MISSING (0101 skipped)"
           grep -n 'rosemary_beat.c' dxb/xnu/bsd/conf/files 2>&1 || echo "conf/files entry MISSING"
           echo "=== compile errors that could explain a stale object (-k keeps going) ==="
@@ -417,6 +419,15 @@ jobs:
             echo 'ERROR: AKS exit marker patch 0105 missing from kernel'; exit 1; }
           strings out/kernel.development.rosemary | grep -F 'vm restrictions applied' >/dev/null || {
             echo 'ERROR: vm restrictions marker patch 0106 missing from kernel'; exit 1; }
+          # 0107: IOLog (not kprintf) markers around every driver start. kprintf
+          # does not reach the ring this boot, so ROSEMARY MATCH lines were
+          # invisible; these are what name the driver that hangs.
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY START: %s start enter' >/dev/null || {
+            echo 'ERROR: start trace patch 0107 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY START: %s startCandidate done' >/dev/null || {
+            echo 'ERROR: startCandidate trace patch 0107 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'ROSEMARY FB: start exit' >/dev/null || {
+            echo 'ERROR: AppleCLCD exit marker patch 0107 missing from kernel'; exit 1; }
           (cd out && shasum -a 256 kernel.development.rosemary > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
