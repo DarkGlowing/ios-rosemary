@@ -1,0 +1,130 @@
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -781,22 +781,121 @@
+ 	}
+ }
+ 
++static int rosemary_log_armed;
++
+ /*
+- * Bring up the UFS block device for logging only. Used when the root is the
+- * USB stick: the console ring exists on every boot, but only the thread
+- * started here copies it to userdata, so a USB-root boot would otherwise
+- * leave no log to pull. Errors are ignored by the caller.
++ * Log-only UFS bring-up.
++ *
++ * The normal rosemary_ufs_init() runs from IOFindBSDRoot() (bsd_init), which a
++ * boot that hangs in the IOKit sweep never reaches. This does the parts the
++ * flusher needs and skips the parts BSD needs: no bdevsw or devfs
++ * registration (BSD is not up) and no HID or sample init. It blocks on the
++ * device, so it only ever runs on its own thread.
++ *
++ * Returns 0 when the partition bounds are known.
++ */
++static int
++rosemary_ufs_log_bringup(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/rosemary-ufs", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("ROSEMARY LOG: no /rosemary-ufs node\n");
++		return ENXIO;
++	}
++	su.regs = ml_io_map(reg[0], reg[1]);
++	if (su.regs == 0) {
++		printf("ROSEMARY LOG: cannot map UFS registers\n");
++		return ENXIO;
++	}
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("ROSEMARY LOG: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	su.dma_pa = ptoa_64(pn);
++	su.lun = 0;
++	su.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&rosemary_ufs_lock);
++	error = ufs_take_over_host();
++	if (!error) {
++		static const uint8_t tur[6] = { 0x00 };
++		/* The first command after the bootloader may report a unit attention. */
++		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		}
++	}
++	if (!error) {
++		error = ufs_find_partition("userdata");
++	}
++	lck_mtx_unlock(&rosemary_ufs_lock);
++	if (error) {
++		printf("ROSEMARY LOG: UFS bring-up failed (%d)\n", error);
++		return error;
++	}
++
++	/* ufs_write_blocks() bounds-checks every request against these. */
++	su.writable = true;
++	su.ready = true;
++	printf("ROSEMARY LOG: UFS ready, block 0x%llx, %llu MiB, DMA at 0x%llx\n",
++	    su.first_block, su.nblocks * UFS_BLOCK >> 20, su.dma_pa);
++	return 0;
++}
++
++static void
++rosemary_log_thread_entry(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t on = 1;
++
++	(void)PE_parse_boot_argn("rosemarylogufs", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	/*
++	 * Let the boot get on with its sweep. A few seconds is enough for the
++	 * console to reach it, and the ring is only 4 MiB, so starting the device
++	 * this late loses nothing.
++	 */
++	(void)tsleep(&rosemary_log_chan, PZERO, "rosemarylogw", hz * 3);
++	if (rosemary_ufs_log_bringup() == 0) {
++		rosemary_log_start();
++	} else {
++		printf("ROSEMARY LOG: disabled, UFS unavailable\n");
++	}
++}
++
++/*
++ * Arm the console-log flusher. Called from PE_lockdown_iokit: the boot always
++ * reaches that, and it is before the sweep that hangs.
+  */
+ void
+ rosemary_ufs_log_only(void)
+ {
+ 	uint32_t on = 1;
++	thread_t thread;
+ 
+ 	(void)PE_parse_boot_argn("rosemarylogufs", &on, sizeof(on));
+-	if (!on || su.ready) {
++	if (!on || rosemary_log_armed) {
+ 		return;
+ 	}
+-	(void)rosemary_ufs_init();
++	rosemary_log_armed = 1;
++
++	/* rd=ufsroot0: the normal init already started the flusher. */
++	if (su.ready) {
++		return;
++	}
++	if (kernel_thread_start(rosemary_log_thread_entry, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
