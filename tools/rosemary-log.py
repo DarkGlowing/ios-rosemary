@@ -12,8 +12,11 @@ import struct, sys
 
 data = open(sys.argv[1], 'rb').read()
 magic, version, size, total, seq = struct.unpack_from('<8sIIQQ', data, 0)
-if magic != b'ROSEMARYLOG':
-    sys.exit('no ROSEMARYLOG header (log never flushed, or wrong area)')
+# bsd/dev/rosemary_ufs.c writes 8 magic bytes; the field is exactly 8 wide.
+# "SWEETLOG" is what the ios-sweet port kept, "SWEETLOG" was the older name.
+if magic not in (b'ROSEMARYL', b'SWEETLOG', b'ROSEMARYLOG'[:8]):
+    sys.exit('no ROSEMARY log header (log never flushed, or wrong area); '
+             'magic=%r' % (magic,))
 ring = data[4096:4096 + size]
 if total <= size:
     text = ring[:total]

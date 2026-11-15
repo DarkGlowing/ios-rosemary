@@ -1,0 +1,54 @@
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -49,6 +49,7 @@
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void rosemary_log_start(void);
++void rosemary_ufs_log_only(void);
+ extern void rosemary_sample_start(void);
+ extern void rosemary_keys_init(void);
+ extern void rosemary_touch_init(void);
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -780,6 +780,24 @@
+ 	}
+ }
+ 
++/*
++ * Bring up the UFS block device for logging only. Used when the root is the
++ * USB stick: the console ring exists on every boot, but only the thread
++ * started here copies it to userdata, so a USB-root boot would otherwise
++ * leave no log to pull. Errors are ignored by the caller.
++ */
++void
++rosemary_ufs_log_only(void)
++{
++	uint32_t on = 1;
++
++	(void)PE_parse_boot_argn("rosemarylogufs", &on, sizeof(on));
++	if (!on || su.ready) {
++		return;
++	}
++	(void)rosemary_ufs_init();
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int rosemary_ufs_rootdev(dev_t *dev);
+ 
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -788,7 +788,14 @@
+ #if defined(ARM64_BOARD_CONFIG_ROSEMARY)
+ 	if (strcmp(rdBootVar, "usbroot0") == 0) {
+ 		extern int rosemary_usbmsc_rootdev(dev_t *dev);
++		extern void rosemary_ufs_log_only(void);
+ 		OSSafeReleaseNULL(matching);
++		/*
++		 * The console ring is kept on every boot; start the UFS flusher so
++		 * the log reaches userdata with a USB root too. Failures are
++		 * ignored: the root is the stick, not userdata.
++		 */
++		rosemary_ufs_log_only();
+ 		int usb_error = rosemary_usbmsc_rootdev(root);
+ 		if (usb_error) {
+ 			panic("IOFindBSDRoot: usbroot0 unavailable: %d", usb_error);

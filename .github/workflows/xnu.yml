@@ -238,8 +238,8 @@ jobs:
         run: |
           set -uo pipefail
           echo "=== patches handed to the build ==="
-          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* xnu/patches/0101* xnu/patches/0103* xnu/patches/0104* xnu/patches/0105* xnu/patches/0106* xnu/patches/0107* xnu/patches/0108* xnu/patches/0109* || echo "MISSING FROM REPO"
-          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* dxb/patches/0101* dxb/patches/0103* dxb/patches/0104* dxb/patches/0105* dxb/patches/0106* dxb/patches/0107* dxb/patches/0108* dxb/patches/0109* || echo "MISSING FROM dxb/patches"
+          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* xnu/patches/0101* xnu/patches/0103* xnu/patches/0104* xnu/patches/0105* xnu/patches/0106* xnu/patches/0107* xnu/patches/0108* xnu/patches/0109* xnu/patches/0110* xnu/patches/0111* || echo "MISSING FROM REPO"
+          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* dxb/patches/0101* dxb/patches/0103* dxb/patches/0104* dxb/patches/0105* dxb/patches/0106* dxb/patches/0107* dxb/patches/0108* dxb/patches/0109* dxb/patches/0110* dxb/patches/0111* || echo "MISSING FROM dxb/patches"
           echo "=== did the patches reach the sources? (dxb/xnu is patched by build.sh) ==="
           grep -c 'StartIOKitMatching enter' dxb/xnu/iokit/Kernel/IOStartIOKit.cpp 2>&1 || true
           grep -c 'ROSEMARY MATCH' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
@@ -255,6 +255,8 @@ jobs:
           grep -c 'probeCandidates loop done' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
           grep -c 'startMatching loop done' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
           grep -c 'probeCandidates return' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
+          grep -c 'rosemarypagehold' dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || true
+          grep -c 'rosemary_ufs_log_only' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
           ls -l dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || echo "rosemary_beat.c MISSING (0101 skipped)"
           grep -n 'rosemary_beat.c' dxb/xnu/bsd/conf/files 2>&1 || echo "conf/files entry MISSING"
           echo "=== compile errors that could explain a stale object (-k keeps going) ==="
@@ -448,6 +450,17 @@ jobs:
             echo 'ERROR: probeCandidates return marker patch 0109 missing from kernel'; exit 1; }
           strings out/kernel.development.rosemary | grep -F 'doServiceMatch pass %u' >/dev/null || {
             echo 'ERROR: doServiceMatch pass marker patch 0109 missing from kernel'; exit 1; }
+          # 0110: 3000 bytes every 6 s cannot be read or photographed. Bigger,
+          # slower, and stops paging a dead log.
+          strings out/kernel.development.rosemary | grep -F 'rosemarypagehold' >/dev/null || {
+            echo 'ERROR: readable pager patch 0110 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'hold %u' >/dev/null || {
+            echo 'ERROR: pager hold line patch 0110 missing from kernel'; exit 1; }
+          # 0111: the console ring is only copied to userdata by a thread that
+          # started in rosemary_ufs_init(), i.e. only for rd=ufsroot0. Start it
+          # for a USB root too or the log can never be pulled.
+          strings out/kernel.development.rosemary | grep -F 'rosemarylogufs' >/dev/null || {
+            echo 'ERROR: log on USB root patch 0111 missing from kernel'; exit 1; }
           (cd out && shasum -a 256 kernel.development.rosemary > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
