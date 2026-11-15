@@ -238,8 +238,8 @@ jobs:
         run: |
           set -uo pipefail
           echo "=== patches handed to the build ==="
-          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* xnu/patches/0101* xnu/patches/0103* xnu/patches/0104* xnu/patches/0105* xnu/patches/0106* xnu/patches/0107* xnu/patches/0108* || echo "MISSING FROM REPO"
-          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* dxb/patches/0101* dxb/patches/0103* dxb/patches/0104* dxb/patches/0105* dxb/patches/0106* dxb/patches/0107* dxb/patches/0108* || echo "MISSING FROM dxb/patches"
+          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* xnu/patches/0101* xnu/patches/0103* xnu/patches/0104* xnu/patches/0105* xnu/patches/0106* xnu/patches/0107* xnu/patches/0108* xnu/patches/0109* || echo "MISSING FROM REPO"
+          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* dxb/patches/0101* dxb/patches/0103* dxb/patches/0104* dxb/patches/0105* dxb/patches/0106* dxb/patches/0107* dxb/patches/0108* dxb/patches/0109* || echo "MISSING FROM dxb/patches"
           echo "=== did the patches reach the sources? (dxb/xnu is patched by build.sh) ==="
           grep -c 'StartIOKitMatching enter' dxb/xnu/iokit/Kernel/IOStartIOKit.cpp 2>&1 || true
           grep -c 'ROSEMARY MATCH' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
@@ -254,6 +254,7 @@ jobs:
           grep -c 'ROSEMARY FB: start exit' dxb/xnu/iokit/Kernel/arm/RosemaryFramebuffer.cpp 2>&1 || true
           grep -c 'probeCandidates loop done' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
           grep -c 'startMatching loop done' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
+          grep -c 'probeCandidates return' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
           ls -l dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || echo "rosemary_beat.c MISSING (0101 skipped)"
           grep -n 'rosemary_beat.c' dxb/xnu/bsd/conf/files 2>&1 || echo "conf/files entry MISSING"
           echo "=== compile errors that could explain a stale object (-k keeps going) ==="
@@ -439,6 +440,14 @@ jobs:
             echo 'ERROR: startMatching trace patch 0108 missing from kernel'; exit 1; }
           strings out/kernel.development.rosemary | grep -F 'startMatching loop done' >/dev/null || {
             echo 'ERROR: startMatching loop marker patch 0108 missing from kernel'; exit 1; }
+          # 0109: log ends at "probeCandidates loop done"; mark each step of the
+          # probeCandidates tail and count passes, so the hang is localised.
+          strings out/kernel.development.rosemary | grep -F 'probeCandidates #%u tail enter' >/dev/null || {
+            echo 'ERROR: probeCandidates tail marker patch 0109 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'probeCandidates return' >/dev/null || {
+            echo 'ERROR: probeCandidates return marker patch 0109 missing from kernel'; exit 1; }
+          strings out/kernel.development.rosemary | grep -F 'doServiceMatch pass %u' >/dev/null || {
+            echo 'ERROR: doServiceMatch pass marker patch 0109 missing from kernel'; exit 1; }
           (cd out && shasum -a 256 kernel.development.rosemary > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
