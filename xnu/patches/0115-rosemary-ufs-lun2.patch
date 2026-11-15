@@ -1,0 +1,84 @@
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -298,6 +298,38 @@
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++/*
++ * Print what the first block of the partition actually holds. The
++ * HFS+ volume header is big endian at 0x400 (sig 0x482b for HFS+,
++ * 0x4858 for case-sensitive HX); ext4 keeps its magic at 0x438;
++ * all zeroes means the wrong LUN or a read that never landed.
++ */
++static void
++ufs_dump_head(void)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	if (ufs_read_blocks(su.first_block, 1)) {
++		printf("ROSEMARY UFS: head read failed\n");
++		return;
++	}
++	uint32_t nz = 0;
++	for (uint32_t i = 0; i < UFS_BLOCK; i++) {
++		nz += (b[i] != 0);
++	}
++	printf("ROSEMARY UFS: block0 nonzero %u of %u, ext4 magic@0x438 %02x%02x\n",
++	    nz, UFS_BLOCK, b[0x438], b[0x439]);
++	const uint32_t *w = (const uint32_t *)(b + 0x400);
++	printf("ROSEMARY UFS: vh@0x400 %08x %08x %08x %08x\n",
++	    w[0], w[1], w[2], w[3]);
++	printf("ROSEMARY UFS: vh@0x410 %08x %08x %08x %08x\n",
++	    w[4], w[5], w[6], w[7]);
++	printf("ROSEMARY UFS: vh@0x420 %08x %08x %08x %08x\n",
++	    w[8], w[9], w[10], w[11]);
++	printf("ROSEMARY UFS: vh@0x430 %08x %08x %08x %08x\n",
++	    w[12], w[13], w[14], w[15]);
++	printf("ROSEMARY UFS: HFS+ sig 482b, HX 4858, ext4 53ef\n");
++}
++
+ static int
+ ufs_find_partition(const char *want)
+ {
+@@ -307,7 +339,11 @@
+ 		return error;
+ 	}
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+-		printf("ROSEMARY UFS: LUN %u has no GPT\n", su.lun);
++		printf("ROSEMARY UFS: LUN %u has no GPT; first 16 bytes:", su.lun);
++		for (int i = 0; i < 16; i++) {
++			printf(" %02x", b[i]);
++		}
++		printf("\n");
+ 		return ENXIO;
+ 	}
+ 	uint64_t entry_lba;
+@@ -617,7 +653,18 @@
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+-	su.lun = 0;
++	/*
++	 * MT6785 exposes three UFS LUNs. LUN 0 and LUN 1 are the small
++	 * (4 MiB) boot LUNs and carry no partition table; the Android
++	 * GPT -- and userdata -- are on LUN 2. Reading LUN 0 therefore
++	 * returned zeros and looked like "no GPT".
++	 */
++	uint32_t lun = 2;
++	(void)PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
++	if (lun > 7) {
++		lun = 2;
++	}
++	su.lun = (uint8_t)lun;
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&rosemary_ufs_lock);
+@@ -630,6 +677,9 @@
+ 	}
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
++		if (!error) {
++			ufs_dump_head();
++		}
+ 	}
+ 	lck_mtx_unlock(&rosemary_ufs_lock);
+ 	if (error) {
