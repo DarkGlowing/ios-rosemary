@@ -1,0 +1,85 @@
+--- a/bsd/dev/rosemary_beat.c
++++ b/bsd/dev/rosemary_beat.c
+@@ -55,8 +55,14 @@
+ static uint32_t rosemary_beat_line = 15;        /* full line every N ticks */
+ static uint32_t rosemary_page_from = 8;         /* first page, seconds */
+ static uint32_t rosemary_page_every = 6;        /* next pages, seconds */
+-static uint32_t rosemary_page_bytes = 3000;     /* ~50 lines of 80 chars */
++static uint32_t rosemary_page_bytes = 7000;     /* ~80 lines of 80 chars */
+ static int rosemary_page_back;                   /* walk backwards instead of tail */
++/* Set once the page has been frozen: the ring is no longer copied into the
++ * page buffer, so what is on screen is what was there at freeze time. */
++static int rosemary_page_frozen;
++static uint32_t rosemary_page_freeze_at;         /* from rosemarypagehold */
++static uint32_t rosemary_page_quiet;             /* beats with no new output */
++static uint64_t rosemary_page_last_seen;
+ static int rosemary_beat_chan;
+ 
+ static uint32_t rosemary_beat_count;
+@@ -123,6 +129,10 @@
+ 	printf("\nROSEMARY LOGPAGE: bytes %llu..%llu of %llu\n", page_begin, pos, log_total);
+ 	printf("%s", pg);
+ 	printf("\nROSEMARY LOGPAGE: end (bytes %llu..%llu)\n", page_begin, pos);
++	if (rosemary_page_frozen) {
++		printf("ROSEMARY LOGPAGE: FROZEN at %llu bytes (rosemarypagehold=%u)\n",
++		    log_total, rosemary_page_freeze_at);
++	}
+ 	rosemary_log_pause = 0;
+ 	if (rosemary_page_back) {
+ 		rosemary_page_end = page_begin;
+@@ -136,8 +146,8 @@
+ 	uint32_t page_no = 0;
+ 	uint64_t last_total = rosemary_bootlog_position();
+ 
+-	printf("ROSEMARY BEAT: start (tick %us, first page after %us, then every %us)\n",
+-	    rosemary_beat_secs, rosemary_page_from, rosemary_page_every);
++	printf("ROSEMARY BEAT: start (tick %us, first page after %us, then every %us, freeze after %us quiet)\n",
++	    rosemary_beat_secs, rosemary_page_from, rosemary_page_every, rosemary_page_freeze_at);
+ 	for (;;) {
+ 		(void)tsleep(&rosemary_beat_chan, PZERO, "rosemarybt",
+ 		    hz * (int)rosemary_beat_secs);
+@@ -170,11 +180,28 @@
+ 			until_page--;
+ 			continue;
+ 		}
++		/*
++		 * Stop once the log stops growing: paging a dead log replaces a
++		 * readable screen with the same text, and the ring keeps moving
++		 * while the boot prints, so an un-frozen page is usually gone
++		 * before it can be read.
++		 */
++		if (log_total != rosemary_page_last_seen) {
++			rosemary_page_last_seen = log_total;
++			rosemary_page_quiet = 0;
++		} else if (rosemary_page_quiet < rosemary_page_freeze_at) {
++			rosemary_page_quiet++;
++		}
++		if (rosemary_page_quiet >= rosemary_page_freeze_at) {
++			rosemary_page_frozen = 1;
++		}
++
+ 		/* Page the log, then give the reader time to photograph it. */
+ 		page_no++;
+ 		printf("ROSEMARY LOGPAGE: page %u\n", page_no);
+ 		rosemary_page();
+-		until_page = rosemary_page_every;
++		/* A frozen page is final: do not replace it. */
++		until_page = rosemary_page_frozen ? 0 : rosemary_page_every;
+ 	}
+ }
+ 
+@@ -190,6 +217,14 @@
+ 	(void)PE_parse_boot_argn("rosemarypage", &rosemary_page_from, sizeof(rosemary_page_from));
+ 	(void)PE_parse_boot_argn("rosemarypageevery", &rosemary_page_every, sizeof(rosemary_page_every));
+ 	(void)PE_parse_boot_argn("rosemarypageback", &rosemary_page_back, sizeof(rosemary_page_back));
++	(void)PE_parse_boot_argn("rosemarypagehold", &rosemary_page_freeze_at, sizeof(rosemary_page_freeze_at));
++	if (rosemary_page_freeze_at == 0 || rosemary_page_freeze_at > 60) {
++		rosemary_page_freeze_at = 3;
++	}
++	if (rosemary_page_freeze_at > rosemary_page_every) {
++		/* A freeze later than the page period would never be reached. */
++		rosemary_page_freeze_at = rosemary_page_every;
++	}
+ 	if (rosemary_page_every == 0) {
+ 		printf("ROSEMARY BEAT: log paging disabled\n");
+ 	}
