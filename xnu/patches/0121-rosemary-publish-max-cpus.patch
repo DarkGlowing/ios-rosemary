@@ -1,16 +1,17 @@
 --- a/pexpert/arm/pe_init.c
 +++ b/pexpert/arm/pe_init.c
-@@ -391,6 +391,18 @@
- 	extern void rosemary_wdt_map(void);
- 	rosemary_wdt_map();
- 	rosemary_beat_start();
+@@ -402,6 +402,19 @@
+ 		extern void rosemary_ufs_log_only(void);
+ 		rosemary_ufs_log_only();
+ 	}
 +	/*
 +	 * Publish max_cpus now. ml_wait_max_cpus() sleeps until
-+	 * ml_set_max_cpus() has run, and the only caller is RosemaryCPU::start(),
-+	 * whose IONameMatch is 'qcom,kryo470' -- a Qualcomm node that does not
-+	 * exist in this MediaTek device tree. Without this, mcache_init() in
-+	 * bsd_init sleeps forever, which is exactly where the boot stopped
-+	 * (last line: "calling proc_uuid_policy_init()").
++	 * ml_set_max_cpus() has run, and the only caller is
++	 * RosemaryCPU::start(), whose IONameMatch is 'qcom,kryo470' -- a
++	 * Qualcomm node that does not exist in this MediaTek device tree.
++	 * Without this, mcache_init() in bsd_init sleeps forever, which is
++	 * exactly where the boot stopped (last line: "calling
++	 * proc_uuid_policy_init()").
 +	 */
 +	{
 +		extern void ml_set_max_cpus(unsigned int max_cpus);
