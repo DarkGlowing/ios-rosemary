@@ -1,0 +1,19 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -78,7 +78,15 @@
+ 	t.tv_nsec = 0;
+ 
+ // RTC is not present on this target
+-#ifndef BCM2837
++/*
++ * ROSEMARY publishes no IORTC driver, so waitForService() below would
++ * block for its whole 30 s timeout. The watchdog fires at about that
++ * moment and the phone resets -- which is exactly where bsd_init stopped:
++ * the last line was "calling IOKitInitializeTime" and ~30 s later the
++ * phone rebooted. Skip the wait the same way BCM2837 already does; the
++ * calendar then starts unset until a real RTC driver is added.
++ */
++#if !defined(BCM2837) && !defined(ARM64_BOARD_CONFIG_ROSEMARY)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
