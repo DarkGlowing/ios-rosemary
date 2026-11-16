@@ -24,7 +24,7 @@ on:
         description: ignore the object cache (touch every source, full rebuild)
         default: "false"
   push:
-    branches: [main]
+    branches: [main, master]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
