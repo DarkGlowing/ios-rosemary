@@ -1,6 +1,6 @@
 --- a/pexpert/arm/pe_init.c
 +++ b/pexpert/arm/pe_init.c
-@@ -402,6 +402,19 @@
+@@ -402,6 +402,20 @@
  		extern void rosemary_ufs_log_only(void);
  		rosemary_ufs_log_only();
  	}
@@ -15,6 +15,7 @@
 +	 */
 +	{
 +		extern void ml_set_max_cpus(unsigned int max_cpus);
++		extern struct machine_info machine_info;
 +		ml_set_max_cpus(machine_info.max_cpus);
 +	}
  #endif
