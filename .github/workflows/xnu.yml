@@ -42,12 +42,12 @@ env:
 
 jobs:
   build:
-    # macos-14 is retired on 2026-11-02. macos-15 ships Xcode 16.x, whose iig
-    # emits IORPC.kernelContent; patch 0089 backports that field from xnu-11215.
-    # macos-15 queues for a long time and normally carries Xcode 16, whose
-    # iig emits IORPC.kernelContent -- an ABI this xnu-8796 does not have.
-    # macos-14 ships Xcode 15.x (correct ABI) and has far more capacity.
-    runs-on: macos-14
+    # macos-14 was retired on 2026-11-02 and now fails instantly with
+    # "configuration 'macos-14-arm64-us-default' is not supported".
+    # macos-15 is the oldest image still offered, it is what produced every
+    # build from k54 through k64, and patch 0089 backports the IORPC field
+    # (kernelContent) its Xcode 16 iig emits, so the ABI matches xnu-8796.
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
