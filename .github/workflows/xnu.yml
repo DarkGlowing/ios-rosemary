@@ -44,7 +44,10 @@ jobs:
   build:
     # macos-14 is retired on 2026-11-02. macos-15 ships Xcode 16.x, whose iig
     # emits IORPC.kernelContent; patch 0089 backports that field from xnu-11215.
-    runs-on: macos-15
+    # macos-15 queues for a long time and normally carries Xcode 16, whose
+    # iig emits IORPC.kernelContent -- an ABI this xnu-8796 does not have.
+    # macos-14 ships Xcode 15.x (correct ABI) and has far more capacity.
+    runs-on: macos-14
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
