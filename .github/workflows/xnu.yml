@@ -93,9 +93,15 @@ jobs:
           # failed to compile under `make -k` kept its cached object, so several
           # builds shipped a kernel identical to the previous one while the
           # sources had changed. A version bump forces one honest full build.
-          key: buildobj-v3-${{ env.MACHINE_CONFIG }}-${{ github.sha }}
+          # v4: the key used to contain github.sha, so it never matched a
+          # previous run and every commit paid for a full rebuild (~10 min).
+          # It now depends on the patch set instead: a run reuses the objects
+          # of every source no patch touches, and the "Drop cached objects"
+          # step below still removes the objects of the files that DID change,
+          # so a stale object cannot hide a patch.
+          key: buildobj-v4-${{ env.MACHINE_CONFIG }}-${{ hashFiles('xnu/patches/**', '.github/workflows/xnu.yml') }}
           restore-keys: |
-            buildobj-v3-${{ env.MACHINE_CONFIG }}-
+            buildobj-v4-${{ env.MACHINE_CONFIG }}-
 
       - name: Drop cached objects of every source a patch rewrites
         # A patched file whose compile fails under `make -k` keeps the object
