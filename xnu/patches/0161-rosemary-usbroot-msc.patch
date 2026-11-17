@@ -11,7 +11,7 @@
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
 @@ -794,2 +794,31 @@
-+#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
++#if defined(ROSEMARY)
 +//
 +//	ROSEMARY: root on a USB mass-storage volume (bsd/dev/rosemary_usbmsc.c).
 +//	The internal UFS root above stays available: the two are selected by
