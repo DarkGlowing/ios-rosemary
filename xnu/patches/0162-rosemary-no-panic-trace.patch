@@ -1,0 +1,32 @@
+--- a/pexpert/arm/pe_identify_machine.c
++++ b/pexpert/arm/pe_identify_machine.c
+@@ -405,6 +405,21 @@
+ void
+ PE_arm_debug_enable_trace(bool should_log)
+ {
++#if defined(ROSEMARY)
++	/*
++	 * Runs on every CPU from arm_cpu_init(), and the second CPU never comes
++	 * back from it: the boot console ends at "PE_arm_debug_enable_trace
++	 * enter" and "exit" is never printed. The whole path is Apple's PMU
++	 * debug interface, described by /arm-io/cpu-debug-interface, which no
++	 * MediaTek device tree has: pe_arm_init_debug() therefore left the
++	 * command buffers NULL and never selected a trace mode, so the only
++	 * work left here is the kprintf pair, taken while the CPU that is
++	 * waiting for this very CPU to report in is still holding the console.
++	 * Do nothing at all.
++	 */
++	(void)should_log;
++	return;
++#else
+ 	if (should_log) {
+ 		panic_trace_log("%s enter", __FUNCTION__);
+ 	}
+@@ -416,6 +431,7 @@
+ 	if (should_log) {
+ 		panic_trace_log("%s exit", __FUNCTION__);
+ 	}
++#endif /* ROSEMARY */
+ }
+ 
+ static void
