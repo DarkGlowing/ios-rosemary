@@ -1,0 +1,246 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -40,10 +40,27 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define SCRATCH 0x21000u
+ #define MAX_SCRATCH 32u
+ 
++/* Progress marker for IOFindBSDRoot: when the root attach fails the panic
++ * string carries this number, so a bare error code no longer hides whether
++ * the stick was missing, the descriptors failed or the volume was not HFS+.
++ * Values are set in the order the attach performs them. */
++int rosemary_usbmsc_stage;
++#define RS_STAGE_ENTRY      1  /* rootdev() entered, boot-arg parsed */
++#define RS_STAGE_MMIO       2  /* USB/PHY/PMIC registers mapped */
++#define RS_STAGE_DMA        3  /* contiguous DMA pool allocated */
++#define RS_STAGE_CONTROLLER 4  /* xHCI reset/halt/RUN done */
++#define RS_STAGE_PORT       5  /* a port reported CCS+enabled */
++#define RS_STAGE_DEVICE     6  /* descriptors read, BOT endpoints found */
++#define RS_STAGE_PROBE      7  /* INQUIRY/READ CAPACITY issued */
++#define RS_STAGE_CAPACITY   8  /* capacity known, reading volume headers */
++#define RS_STAGE_HFS        9  /* HFS+ volume header validated */
++#define RS_STAGE_BDEVSW     10 /* block device registered */
++#define RS_STAGE_READY      11 /* usbroot0 usable */
++
+ struct usb_ring { uint32_t off, index, cycle; };
+ static struct {
+  vm_offset_t usb, op, rt, db, phy, ippc, infra, gpio, pool;
+- uint64_t pa, sectors;
++ uint64_t pa, sectors, base_lba;
+  uint32_t slot, port, speed, in, out, mpsi, mpso, iface, tag, blocksize;
+  uint32_t ei, ec, maxslots;
+  struct usb_ring cmd, ep0, bin, bout;
+@@ -80,6 +97,9 @@ static uint32_t le32(const uint8_t *p) {
+ static uint32_t be32(const uint8_t *p) {
+  return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+ }
++static uint64_t le64(const uint8_t *p) {
++ return (uint64_t)le32(p)|((uint64_t)le32(p+4)<<32);
++}
+ static void put32(uint8_t *p,uint32_t v) {
+  p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);p[2]=(uint8_t)(v>>16);p[3]=(uint8_t)(v>>24);
+ }
+@@ -339,6 +359,7 @@ static int start_controller(void) {
+   /* First implementation is USB2 high speed; no hub/TT or SuperSpeed. */
+   if(sc.speed!=3)return ENOTSUP;
+   printf("usbmsc: port=%u speed=%u dma=%llx\n",sc.port,sc.speed,(unsigned long long)sc.pa);
++  rosemary_usbmsc_stage=RS_STAGE_PORT;
+   return 0;
+  }
+  return ENODEV;
+@@ -408,6 +429,7 @@ static int enumerate(void) {
+  clean(INPUT,4096);
+  if((err=command(12,phys(INPUT),sc.slot<<24,NULL)))return err;
+  printf("usbmsc: BOT endpoints in=%u out=%u\n",sc.in,sc.out);
++ rosemary_usbmsc_stage=RS_STAGE_DEVICE;
+  return 0;
+ }
+ static int bulk(bool in,uint32_t off,uint32_t size,uint32_t *actual) {
+@@ -466,21 +488,101 @@ static int read_blocks(uint64_t lba,uint32_t count) {
+  uint8_t c[10]={0x28,0,(uint8_t)(lba>>24),(uint8_t)(lba>>16),(uint8_t)(lba>>8),(uint8_t)lba,0,(uint8_t)(count>>8),(uint8_t)count,0};
+  return scsi(c,10,count*512);
+ }
++/* Validate an HFS+ volume header at base+2 and remember where the volume
++ * starts: a stick written with an iOS root image has it at absolute LBA 2,
++ * but a stick formatted the usual way keeps it inside a partition, and the
++ * buffer cache talks in blocks relative to the volume, not to the disk. */
++static int hfs_volume(uint64_t base,const char *where) {
++ if(base>(uint64_t)0xffffffffull||base+2>=sc.sectors)return ENODEV;
++ if(read_blocks(base+2,1))return EIO;
++ uint8_t *v=mem(DATA);
++ printf("usbmsc: %s vh '%c%c' lba=%llu\n",where,
++     (v[0]>=32&&v[0]<127)?v[0]:'.',(v[1]>=32&&v[1]<127)?v[1]:'.',
++     (unsigned long long)(base+2));
++ if(v[0]=='H'&&(v[1]=='X'||v[1]=='+')) {
++  uint32_t bs=be32(v+40),blocks=be32(v+44);
++  if(bs<512||bs>65536||(bs&(bs-1))||!blocks)return EIO;
++  if((uint64_t)bs*blocks>(sc.sectors-base)*512)return EIO;
++  sc.base_lba=base;sc.blocksize=bs;
++  printf("usbmsc: HFS%c base=%llu block=%u blocks=%u (read-only)\n",
++      v[1],(unsigned long long)base,bs,blocks);
++  rosemary_usbmsc_stage=RS_STAGE_HFS;
++  return 0;
++ }
++ if(v[0]=='B'&&v[1]=='D') {
++  /* HFS wrapper: the MDB 1024 bytes into the volume points at the embedded
++   * HFS+ volume (drAlBlSt, in 512-byte allocation blocks). */
++  if(read_blocks(base,2))return EIO;
++  uint8_t *m=mem(DATA)+1024;
++  uint32_t alblst=((uint32_t)m[28]<<8)|m[29];
++  printf("usbmsc: %s HFS wrapper alblst=%u\n",where,alblst);
++  if(!alblst)return ENODEV;
++  return hfs_volume(base+alblst,"embedded");
++ }
++ return ENODEV;
++}
++
++/* A bare image first, then the two partition tables the stick may carry. */
++static int find_hfs(void) {
++ int err=hfs_volume(0,"bare");
++ if(!err)return 0;
++ int last=(err!=ENODEV)?err:ENODEV;
++ if(!read_blocks(0,1)) {
++  uint8_t *s=mem(DATA);
++  if(s[32]=='N'&&s[33]=='X'&&s[34]=='S'&&s[35]=='B')
++   printf("usbmsc: APFS container at lba0, HFS+ probe cannot mount it\n");
++  if(s[510]==0x55&&s[511]==0xaa) {
++   for(unsigned i=0;i<4;i++) {
++    uint8_t *e=s+446+i*16;
++    uint32_t start=le32(e+8);
++    if(!e[4]||!start)continue;
++    printf("usbmsc: mbr[%u] type=%02x start=%u\n",i,e[4],start);
++    err=hfs_volume(start,"mbr");if(!err)return 0;
++    if(err!=ENODEV)last=err;
++   }
++  }
++ }
++ if(!read_blocks(1,1)) {
++  uint8_t *g=mem(DATA);
++  int gpt=1;for(unsigned k=0;k<8;k++)if(g[k]!="EFI PART"[k])gpt=0;
++  if(gpt) {
++   uint64_t ent=le64(g+72);uint32_t nent=le32(g+80),esz=le32(g+84);
++   printf("usbmsc: gpt entries=%llu n=%u esz=%u\n",
++       (unsigned long long)ent,nent,esz);
++   if(esz>=128&&esz<=512&&nent&&nent<=256&&ent>=2&&ent<sc.sectors) {
++    for(uint32_t i=0;i<nent;i++) {
++     uint64_t lba=ent+((uint64_t)i*esz)/512;uint32_t off=(uint32_t)(((uint64_t)i*esz)%512);
++     if(lba>=sc.sectors||read_blocks(lba,1))break;
++     uint8_t *e=mem(DATA)+off;int used=0;
++     for(unsigned k=0;k<16;k++)used|=e[k];
++     if(!used)continue;
++     uint64_t first=le64(e+32);
++     if(!first||first>=sc.sectors)continue;
++     printf("usbmsc: gpt[%u] first=%llu\n",i,(unsigned long long)first);
++     if(!read_blocks(first,1)&&mem(DATA)[32]=='N'&&mem(DATA)[33]=='X')
++      printf("usbmsc: gpt[%u] is an APFS container\n",i);
++     err=hfs_volume(first,"gpt");if(!err)return 0;
++     if(err!=ENODEV)last=err;
++    }
++   }
++  }
++ }
++ printf("usbmsc: no HFS+ volume on %llu sectors, last errno=%d\n",
++     (unsigned long long)sc.sectors,last);
++ return last;
++}
+ static int probe_disk(void) {
+  uint8_t inquiry[6]={0x12,0,0,0,36,0},cap[10]={0x25};
+  int err=scsi(inquiry,6,36);if(err)return err;
+  if((mem(DATA)[0]&31)!=0)return ENOTSUP;
++ rosemary_usbmsc_stage=RS_STAGE_PROBE;
+  err=scsi(cap,10,8);if(err)return err;
+  uint32_t last=be32(mem(DATA)),size=be32(mem(DATA)+4);
+  if(last==0xffffffffu||size!=512)return ENOTSUP;
+  sc.sectors=(uint64_t)last+1;sc.blocksize=512;
+  printf("usbmsc: capacity=%llu sectors size=%u\n",(unsigned long long)sc.sectors,size);
+- if((err=read_blocks(2,1)))return err;
+- uint8_t *v=mem(DATA);
+- if(v[0]!='H'||(v[1]!='X'&&v[1]!='+'))return ENODEV;
+- uint32_t bs=be32(v+40),blocks=be32(v+44);
+- if(bs<512||bs>65536||(bs&(bs-1))||!blocks||((uint64_t)bs*blocks)>sc.sectors*512)return EIO;
+- printf("usbmsc: HFS%c block=%u blocks=%u (read-only)\n",v[1],bs,blocks);
++ rosemary_usbmsc_stage=RS_STAGE_CAPACITY;
++ if(find_hfs())return ENODEV;
+  return 0;
+ }
+ static void usbmsc_strategy(struct buf *bp) {
+@@ -491,8 +593,8 @@ static void usbmsc_strategy(struct buf *bp) {
+  if(!(buf_flags(bp)&B_READ)){err=EROFS;goto out;}
+  /* buf_blkno follows the logical block size negotiated by HFS. */
+  uint64_t factor=sc.blocksize/512;
+- if(block<0||(bytes&511)||((uint64_t)block>sc.sectors/factor)){err=EINVAL;goto out;}
+- uint64_t lba=(uint64_t)block*factor;
++ if(block<0||(bytes&511)||((uint64_t)block>(sc.sectors-sc.base_lba)/factor)){err=EINVAL;goto out;}
++ uint64_t lba=(uint64_t)block*factor+sc.base_lba;
+  if(bytes/512>sc.sectors-lba){err=EINVAL;goto out;}
+  uint8_t *dest=(uint8_t *)(uintptr_t)buf_dataptr(bp);
+  if(!dest&&bytes){err=EINVAL;goto out;}
+@@ -514,7 +616,7 @@ static int usbmsc_ioctl(__unused dev_t dev,u_long cmd,caddr_t data,__unused int
+  case DKIOCGETPHYSICALBLOCKSIZE:*v=512;break;
+  case DKIOCSETBLOCKSIZE:
+   if(*v<512||*v>4096||(*v&(*v-1)))err=EINVAL;else sc.blocksize=*v;break;
+- case DKIOCGETBLOCKCOUNT:*q=sc.sectors*512/sc.blocksize;break;
++ case DKIOCGETBLOCKCOUNT:*q=(sc.sectors-sc.base_lba)*512/sc.blocksize;break;
+  case DKIOCISWRITABLE:*v=0;break;
+  case DKIOCSYNCHRONIZE:case DKIOCSYNCHRONIZECACHE:break;
+  case DKIOCGETMAXBLOCKCOUNTREAD:*q=DATA_SIZE/sc.blocksize;break;
+@@ -530,6 +632,7 @@ static struct bdevsw usbmsc_bdevsw={.d_open=usbmsc_open,.d_close=usbmsc_close,
+ int rosemary_usbmsc_rootdev(dev_t *dev) {
+  int enabled=1,err;PE_parse_boot_argn("usbmsc",&enabled,sizeof(enabled));
+  printf("usbmsc: root entry enabled=%d\n",enabled);
++ rosemary_usbmsc_stage=RS_STAGE_ENTRY;
+  if(!enabled)return ENXIO;
+  lck_mtx_lock(&usbmsc_lock);
+  printf("usbmsc: root lock acquired\n");
+@@ -540,20 +643,25 @@ int rosemary_usbmsc_rootdev(dev_t *dev) {
+  sc.gpio=ml_io_map(0x10005000,0x1000);
+  if(!sc.usb||!sc.ippc||!sc.phy||!sc.infra||!sc.gpio){err=ENOMEM;goto out;}
+  printf("usbmsc: mmio mapped\n");
++ rosemary_usbmsc_stage=RS_STAGE_MMIO;
+  if(kmem_alloc_contig(kernel_map,&sc.pool,POOL_SIZE,0xffff,0,0,
+     KMA_DATA|KMA_ZERO|KMA_PERMANENT,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS){err=ENOMEM;goto out;}
+  ppnum_t pn=pmap_find_phys(kernel_pmap,(addr64_t)sc.pool);
+  sc.pa=ptoa_64(pn);
+  printf("usbmsc: dma allocated va=%llx pa=%llx\n",(unsigned long long)sc.pool,(unsigned long long)sc.pa);
++ rosemary_usbmsc_stage=RS_STAGE_DMA;
+  if(!pn||(sc.pa&0xffff)){err=ENOMEM;goto out;}
+  for(uint32_t off=0;off<POOL_SIZE;off+=PAGE_SIZE)
+   if(ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(sc.pool+off)))!=sc.pa+off){err=ENOMEM;goto out;}
+  printf("usbmsc: native xHCI/BOT probe\n");
++ rosemary_usbmsc_stage=RS_STAGE_CONTROLLER;
+  err=enumerate();if(err)goto out;
+  err=probe_disk();if(err)goto out;
++ rosemary_usbmsc_stage=RS_STAGE_BDEVSW;
+  int majorno=bdevsw_add(-1,&usbmsc_bdevsw);
+  if(majorno<0){err=ENODEV;goto out;}
+  sc.dev=makedev(majorno,0);sc.ready=true;*dev=sc.dev;
++ rosemary_usbmsc_stage=RS_STAGE_READY;
+  printf("usbmsc: usbroot0 ready, read-only, major=%d\n",majorno);
+ out:
+  if(err) {
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -788,6 +788,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ #if defined(ARM64_BOARD_CONFIG_ROSEMARY)
+ 	if (strcmp(rdBootVar, "usbroot0") == 0) {
+ 		extern int rosemary_usbmsc_rootdev(dev_t *dev);
++		extern int rosemary_usbmsc_stage;
+ 		extern void rosemary_ufs_log_only(void);
+ 		OSSafeReleaseNULL(matching);
+ 		/*
+@@ -798,7 +799,15 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		rosemary_ufs_log_only();
+ 		int usb_error = rosemary_usbmsc_rootdev(root);
+ 		if (usb_error) {
+-			panic("IOFindBSDRoot: usbroot0 unavailable: %d", usb_error);
++			/* The errno alone cannot tell a missing stick from a stick whose
++			 * volume is not HFS+; the stage says how far attach got. */
++			panic("IOFindBSDRoot: usbroot0 unavailable: %d (stage %d: %s)",
++			    usb_error, rosemary_usbmsc_stage,
++			    rosemary_usbmsc_stage >= 9 ? "HFS+ volume ok" :
++			    rosemary_usbmsc_stage >= 7 ? "no HFS+ volume at lba2 or in a partition" :
++			    rosemary_usbmsc_stage >= 5 ? "xHCI port up, no device" :
++			    rosemary_usbmsc_stage >= 3 ? "controller did not start" :
++			    rosemary_usbmsc_stage >= 1 ? "MMIO/DMA setup" : "entry");
+ 		}
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
+ 		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
