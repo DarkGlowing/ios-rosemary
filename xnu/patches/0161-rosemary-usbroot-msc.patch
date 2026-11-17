@@ -10,10 +10,7 @@
  bsd/dev/sweet_ufs.c			standard
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -790,6 +790,34 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
- 	}
- #endif
- 
+@@ -794,2 +794,31 @@
 +#if defined(ARM64_BOARD_CONFIG_ROSEMARY)
 +//
 +//	ROSEMARY: root on a USB mass-storage volume (bsd/dev/rosemary_usbmsc.c).
@@ -42,10 +39,9 @@
 +		goto iofrootx;
 +	}
 +#endif
- 
++
  //
  //	Now check if we are trying to root on a memory device
-new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/rosemary_usbmsc.c
 @@ -0,0 +1,749 @@
