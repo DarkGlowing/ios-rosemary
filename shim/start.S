@@ -1,5 +1,5 @@
 /*
- * rosemary boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
+ * sweet boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
  * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
  */
 	.section .text.head, "ax"
@@ -20,45 +20,10 @@ _head:
 	.globl _start
 _start:
 	msr	daifset, #0xf
-	mov	x19, x0			/* DTB / boot-args pointer from the bootloader */
-	mrs	x20, currentel
-	lsr	x20, x20, #2		/* 1 = EL1, 2 = EL2 */
+	mov	x19, x0			/* DTB pointer from ABL */
 	msr	spsel, #1
 	adr	x1, _stack_top
 	mov	sp, x1
-
-	/*
-	 * MediaTek LK on MT6785 is AArch32 and runs with the MMU on. Depending
-	 * on the ATF configuration it hands a 64-bit payload over at EL1 *or*
-	 * at EL2. If we stay at EL2, `msr vbar_el1` is useless: our exception
-	 * vectors are never used and the first bad access (unmapped MMIO) ends
-	 * up in LK's own EL2 handler, which resets the phone a few seconds
-	 * after power-on — exactly the "black screen, reboot in 5-7s" symptom.
-	 * So: install EL2 vectors first, then drop to EL1 the same way Linux'
-	 * el2_setup does.
-	 */
-	cmp	x20, #2
-	b.ne	5f
-	adr	x1, vectors
-	msr	vbar_el2, x1
-	isb
-	mov	x1, #(1 << 31)		/* HCR_EL2: RW=1 (AArch64 EL1), no traps */
-	msr	hcr_el2, x1
-	mov	x1, #3			/* CNTHCTL_EL2: EL1PCTEN | EL1PCEN */
-	msr	cnthctl_el2, x1
-	msr	cntvoff_el2, xzr
-	movz	x1, #0x33ff		/* CPTR_EL2: do not trap FP/SIMD */
-	msr	cptr_el2, x1
-	movz	x1, #0x0800		/* SCTLR_EL1: MMU, caches off */
-	movk	x1, #0x30d0, lsl #16
-	msr	sctlr_el1, x1
-	isb
-	mov	x1, #0x3c5		/* SPSR_EL2: EL1h, DAIF masked, AArch64 */
-	msr	spsr_el2, x1
-	adr	x1, 5f
-	msr	elr_el2, x1
-	eret
-5:
 	adr	x1, vectors
 	msr	vbar_el1, x1
 	isb
@@ -70,7 +35,6 @@ _start:
 	str	xzr, [x1], #8
 	b	1b
 2:	mov	x0, x19
-	mov	x1, x20
 	bl	shim_main
 3:	wfe
 	b	3b

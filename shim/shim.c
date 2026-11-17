@@ -10,19 +10,14 @@
 #include "console.h"
 #include "mmu.h"
 #include "loader.h"
+#ifndef ROSEMARY
 #include "ufs.h"
-#include "platform_mt6785.h"	/* MT6785: WDT pet + EMI restore (rosemary fixes) */
-#ifdef SHIM_USBPROBE
-#include "usb.h"		/* MT6785 DWC3 host probe (see usb.c) */
 #endif
 
-#define IMEM_RESTART_REASON	0UL	// removed: Qualcomm-only IMEM (MediaTek uses PSCI reset)
+#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0UL	// removed: Qualcomm-only PSHOLD (MediaTek uses PSCI reset)
+#define PSHOLD			0x0c264000UL
 
-#define GICD_BASE		0x0c000000UL
-#define GICR_BASE		0x0c040000UL	/* boot_a DTB: /interrupt-controller reg, 2nd tuple (GICR) */
-#define GICR_SIZE		0x200000UL	/* boot_a DTB: Redistributor window size */
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
 #define GICR_WAKER		0x14
@@ -34,8 +29,6 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		27	/* MediaTek MT6785: standard PPI 11 -> INTID 27. Dump FDT: verify /proc/device-tree/timer interrupts */
-#define PTIMER_INTID		30	/* MediaTek: non-secure physical timer PPI 14 -> INTID 30 (verify in FDT) */
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
@@ -92,70 +85,46 @@ static uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
 	return x0;
 }
 
+#ifdef ROSEMARY
+/* LK leaves the MT6785 watchdog armed. Disable it before handing off to XNU. */
+static uint32_t rosemary_wdt_disable(void)
+{
+	uint32_t before = rd32(0x10007000UL);
+	wr32(0x10007000UL, 0x22000000U); /* TOPRGU key + clear watchdog enable */
+	wr32(0x10007008UL, 0x1971U);     /* restart key */
+	__asm__ volatile("dsb sy; isb" ::: "memory");
+	return before;
+}
+#endif
+
 static uint64_t now(void)
 {
 	isb();
 	return rsr("cntpct_el0");
 }
 
-/*
- * Timer-independent, bounded wait.
- *
- * The original loop was `while (now() < end)` with end derived from
- * cntfrq_el0. If the firmware never programmed CNTFRQ_EL0 (it reads as 0 at
- * handoff on some MTK/ATF combinations) every delay becomes zero-length, so
- * the shim paints one frame, immediately "holds 30 s" for 0 ms, resets, and
- * the phone reboots 5-7 s after power-on with a black screen — exactly the
- * symptom we are chasing. A stuck counter would instead hang forever.
- *
- * So: wait until the timer says we are done OR a fixed iteration budget is
- * spent, whichever comes first. Bounded in both directions.
- */
-#define DEFAULT_FRQ	13000000ULL	/* MediaTek default arm,cpu-regs clock */
-#define SPIN_PER_MS	1500000ULL	/* loop iterations per ms (floor) */
-
 static void delay_ms(unsigned ms)
 {
-	uint64_t f = rsr("cntfrq_el0");
-	if (!f)
-		f = DEFAULT_FRQ;
-	uint64_t per_ms = f / 1000;
-	if (!per_ms)
-		per_ms = 1;
-	uint64_t end = now() + per_ms * (uint64_t)ms;
-	uint64_t spin = (uint64_t)ms * SPIN_PER_MS;
-	uint64_t next_pet = now() + per_ms * 200;	/* pet WDT every ~200 ms */
-
-	while (spin) {
-		if (now() >= end)	/* timer is sane: done */
-			break;
-		if (now() >= next_pet) {
-			wdt_pet();
-			next_pet = now() + per_ms * 200;
-		}
-		spin--;
-		__asm__ volatile("yield" ::: "memory");
-	}
-	wdt_pet();
+	uint64_t end = now() + rsr("cntfrq_el0") / 1000 * ms;
+	while (now() < end)
+		;
 }
 
 static void __attribute__((noreturn)) reset(unsigned after_s)
 {
 	con_skip();
-	con_str("RESET", after_s > 20 ? "in 40s" : after_s > 2 ? "in 20s" : "now");
+	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
 	delay_ms(after_s * 1000);
-	// DRAM/EMI "restore" is disabled: the register values in emi_restore()
-	// are speculative (writing DRAMC_ACTIM0 = 1 can wedge the DRAM), and the
-	// phone already reboots cleanly into LK/Android after a hard reset, so it
-	// is not needed. Keep the function for later, do not call it here.
-	// emi_restore();
-	// MediaTek: no Qualcomm IMEM restart_reason; PSCI reset below
+#ifndef ROSEMARY
+	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
 	__asm__ volatile("dsb sy" ::: "memory");
+#endif
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-	// If PSCI reset is not wired up on this LK/ATF combination, fall back to
-	// the top RGU software-reset register (always works, hard SoC reset).
-	delay_ms(2000);
-	wdt_swreset();
+#ifndef ROSEMARY
+	wr32(PSHOLD, 0);
+#endif
+	for (;;)
+		__asm__ volatile("wfe");
 }
 
 /* ---- exceptions ---- */
@@ -180,27 +149,13 @@ static void irq_handler(void)
 	isb();
 }
 
-static volatile int in_exc;
-
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
 	if (slot == 5) {	/* IRQ from current EL, SPx */
 		irq_handler();
 		return;
 	}
-	/* A fault inside the panic painter (e.g. the framebuffer range is not
-	 * accessible at all) must not recurse forever: skip the console and go
-	 * straight to a hard reset, which the timing test can still detect. */
-	if (in_exc) {
-		delay_ms(500);
-		wdt_swreset();
-	}
-	in_exc = 1;
-	/* Do not clear: keep the console output (JUMP/BOOTARG/SEGS values) on
-	 * screen and print the panic in a coloured band below it. */
-	con_set_dy(0);
-	con_set_bg(0xff300000U);
-	con_set_row(26);
+	con_clear(BLUE);
 	switch (slot & 3) {
 	case 0: con_str("PANIC", "SYNC"); break;
 	case 1: con_str("PANIC", "IRQ"); break;
@@ -425,236 +380,47 @@ static uint64_t ticks_mem(void)
 
 static uint32_t to_us(uint64_t ticks)
 {
-	return ticks * 10 / 130;	/* 13 MHz (MediaTek MT6785 CNTFRQ; verify cntfrq_el0) */
+	uint64_t hz = rsr("cntfrq_el0");
+	return hz ? (uint32_t)(ticks * 1000000 / hz) : 0;
 }
 
-void shim_main(uint64_t dtb, uint64_t el)
+void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
-
-#ifdef SHIM_BARE
-	/* Minimal "did we even get control?" build: paint the screen, pet the
-	 * watchdog forever, never reset. If the phone stays alive here, LK did
-	 * jump to us and the diagnostic reset in the normal build is what makes
-	 * the 5-7 s reboot. If it still reboots, LK never reached our entry. */
-	con_clear(GREEN);
-	con_marks(WHITE);
-	con_str("SHIM", "bare build: alive, petting WDT, no reset");
-	for (;;) {
-		wdt_pet();
-		delay_ms(200);
-	}
+#ifdef ROSEMARY
+	/* Disable LK's watchdog before any framebuffer drawing or payload work. */
+	uint32_t wdt_before = rosemary_wdt_disable();
 #endif
-
-	/* Draw the first diagnostic frame before touching the MTK watchdog.
-	 * If WDT setup itself hangs or resets the SoC, the framebuffer test is
-	 * still visible and the failure is distinguishable from a display fault. */
-	stage = "framebuffer";
-#ifdef SHIM_CONSOLE
-	/* Plain console: solid fill + text. This combination renders perfectly on
-	 * rosemary (verified on hardware). */
-	con_set_dy(0);
-	con_clear(0xff000040U);
-	con_set_row(1);
-	con_hex2("CPU", "el=", (uint32_t)el, "dtb=", (uint32_t)dtb);
-	con_hex2("TIMER", "frq=", (uint32_t)rsr("cntfrq_el0"), "cnt=", (uint32_t)now());
-	con_hex2("WDT", "mode=", wdt_mode(), "len=", wdt_length());
-	con_str("SHIM", "rosemary console ok, reset in 20s");
-	delay_ms(20000);
-	reset(1);
-#endif
-#ifdef SHIM_USBPROBE
-	/* USB host bring-up probe: one boot, stage 0+1, ~30 s. Read the last
-	 * line on screen: it names the step that was about to run, so a hang is
-	 * still a result. Needs a device (stick/hub) in the port to see CCS. */
-	con_set_dy(0);
-	con_clear(0xff000040U);
-	con_set_row(1);
-	con_hex2("CPU", "el=", (uint32_t)el, "dtb=", (uint32_t)dtb);
-	con_hex2("WDT", "mode=", wdt_mode(), "len=", wdt_length());
-	usb_probe(63);
-	con_str("HOLD", "USB probe done: reset in 30s");
-	delay_ms(30000);
-	reset(1);
-#endif
-#ifdef SHIM_LOG
-	/* Log channel that does not depend on the display at all: a text report
-	 * plus a sample of both framebuffer halves is written into the expdb
-	 * partition (GPT: LBA 776, 20 MiB). Read it back with dd from Android or
-	 * recovery and analyse offline. */
-	{
-		static char lb[16384] __attribute__((aligned(4096)));
-		int flat = 0;
-		int pdet = con_detect_pitch(1, &flat);
-		int n = 0;
-		#define P(s) do { for (const char *q = (s); *q; q++) lb[n++] = *q; } while (0)
-		#define H(v) do { for (int sh = 28; sh >= 0; sh -= 4) \
-			lb[n++] = "0123456789ABCDEF"[((uint32_t)(v) >> sh) & 0xf]; } while (0)
-		P("ROSEMARYLOG0001\n");
-		P("el="); H(el); P(" dtb="); H((uint32_t)dtb); P("\n");
-		P("cntfrq="); H((uint32_t)rsr("cntfrq_el0"));
-		P(" cntpct="); H((uint32_t)now()); P("\n");
-		P("wdt_mode="); H(wdt_mode()); P(" wdt_len="); H(wdt_length()); P("\n");
-		P("sctlr_el1="); H(rsr("sctlr_el1")); P(" mpidr="); H(rsr("mpidr_el1")); P("\n");
-		P("fb_base=7BD20000 pitch_detect="); H(pdet); P(" flat="); H(flat); P("\n");
-		P("fb_first16=");
-		for (int i = 0; i < 16; i++) { H(((volatile uint8_t *)FB_BASE)[i]); P(" "); }
-		P("\n");
-		int rc1 = ufs_write_raw(776, lb, 16384);
-		/* 1 MiB from each 2400-row half (64 KiB per UFS command) */
-		int rc2 = 0;
-		for (int i = 0; i < 16 && !rc2; i++)
-			rc2 = ufs_write_raw(800 + i * 16, (void *)(FB_BASE + (uintptr_t)i * 0x10000), 0x10000);
-		int rc3 = 0;
-		for (int i = 0; i < 16 && !rc3; i++)
-			rc3 = ufs_write_raw(1100 + i * 16,
-				(void *)(FB_BASE + 2400UL * 1088UL * 4UL + (uintptr_t)i * 0x10000), 0x10000);
-		/* rewrite the header with the results */
-		n = 0;
-		P("ROSEMARYLOG0001\n");
-		P("write rc hdr="); H(rc1); P(" fb0="); H(rc2); P(" fb1="); H(rc3); P("\n");
-		P("el="); H(el); P(" pitch_detect="); H(pdet); P(" flat="); H(flat); P("\n");
-		ufs_write_raw(776, lb, 16384);
-		#undef P
-		#undef H
-		con_clear(BLUE);
-		con_str("LOG", "report written to expdb lba 776");
-		con_hex2("LOG", "rc=", (uint32_t)((rc1 & 0xff) << 16 | (rc2 & 0xff) << 8 | (rc3 & 0xff)),
-			 "pitch=", (uint32_t)pdet);
-		delay_ms(20000);
-		reset(1);
-	}
-#endif
-#ifdef SHIM_AUTO
-	/* Minimal console: black background + text, line pitch auto-detected from
-	 * the boot logo LK left in the framebuffer. */
-	{
-		int flat = 0;
-		int p = con_detect_pitch(1, &flat);
-		con_set_pitch(p);
-		con_paint_buf(1, 0);
-		con_set_dy(FB_H);
-		con_set_row(2);
-		con_hex2("PITCH", "detected=", (uint32_t)p, "flat=", (uint32_t)flat);
-		con_hex2("CPU", "el=", (uint32_t)el, "dtb=", (uint32_t)dtb);
-		con_hex2("TIMER", "frq=", (uint32_t)rsr("cntfrq_el0"), "cnt=", (uint32_t)now());
-		con_hex2("WDT", "mode=", wdt_mode(), "len=", wdt_length());
-		con_str("SHIM", "rosemary console, black background");
-		con_str("HOLD", "reset in 30s");
-		con_mirror_first();
-		delay_ms(30000);
-		reset(1);
-	}
-#endif
-#ifdef SHIM_PITCHSCAN
-	/* Eight labels, eight pitches, one boot. The crisp line names the pitch. */
-	static const int cand[8] = { 1080, 1088, 1024, 1056, 1104, 1120, 1152, 960 };
-	static const char *lab[8] = { "P1080", "P1088", "P1024", "P1056",
-				      "P1104", "P1120", "P1152", "P0960" };
-	static const uint32_t col[8] = { WHITE, RED, GREEN, YELLOW,
-					 0xff00ffffU, 0xffff00ffU, 0xff4080ffU, 0xffa0a0a0U };
-	con_paint_buf(0, 0xff000020U);
-	con_paint_buf(1, 0xff000020U);
-	for (int i = 0; i < 8; i++)
-		con_label_pitch(lab[i], 120 + i * 280, cand[i], col[i]);
-	con_set_dy(FB_H);
-	con_set_row(0);
-	con_str("SCAN", "8 pitches, read the crisp line");
-	con_set_dy(0);
-	delay_ms(30000);
-	reset(1);
-#endif
-#ifdef SHIM_SIMPLE
-	/* Pragmatic console: solid fill + text in BOTH buffers, nothing else.
-	 * Solid fills and glyphs render cleanly on this panel; fine horizontal
-	 * structures (rulers, bars) come out smeared, so we simply do not use
-	 * them. This is all a bring-up console needs. */
-	con_paint_buf(0, 0xff000020U);
-	con_paint_buf(1, 0xff000020U);
-	con_set_dy(0);
-	con_set_row(4);
-	con_hex2("CPU", "el=", (uint32_t)el, "dtb=", (uint32_t)dtb);
-	con_hex2("TIMER", "frq=", (uint32_t)rsr("cntfrq_el0"), "cnt=", (uint32_t)now());
-	con_hex2("FB", "w=", FB_W, "stride=", FB_STRIDE);
-	con_hex2("WDT", "mode=", wdt_mode(), "len=", wdt_length());
-	con_str("SHIM", "rosemary console on buffer 0");
-	con_set_dy(FB_H);
-	con_set_row(4);
-	con_hex2("CPU", "el=", (uint32_t)el, "dtb=", (uint32_t)dtb);
-	con_hex2("TIMER", "frq=", (uint32_t)rsr("cntfrq_el0"), "cnt=", (uint32_t)now());
-	con_hex2("FB", "w=", FB_W, "stride=", FB_STRIDE);
-	con_hex2("WDT", "mode=", wdt_mode(), "len=", wdt_length());
-	con_str("SHIM", "rosemary console on buffer 1");
-	con_set_dy(0);
-	con_str("HOLD", "solid+text test, reset in 30s");
-	delay_ms(30000);
-	reset(1);
-#endif
-#ifdef SHIM_GEOM2
-	/* The panel scans buffer 1 (verified: painting #1 blue turned the screen
-	 * blue). Draw everything there. */
-	con_geom2(1);
-	con_set_dy(FB_H);
-	con_set_row(6);
-	con_hex2("CPU", "el=", (uint32_t)el, "frq=", (uint32_t)rsr("cntfrq_el0"));
-	con_str("GEOM2", "9 rulers, centre line, corner squares");
-	con_str("HOLD", "buffer 1 frame, reset in 30s");
-	con_mirror_first();	/* keep buffer 0 identical */
-	delay_ms(30000);
-	reset(1);
-#endif
-#ifdef SHIM_BUFID
-	/* Which of the two 2400-row buffers does the panel actually scan?
-	 * Buffer 0 red, buffer 1 blue, each labelled inside itself. */
-	con_paint_buf(0, RED);
-	con_paint_buf(1, 0xff0000ffU);
-	con_set_dy(0);
-	con_set_row(6);
-	con_hex2("BUF0", "el=", (uint32_t)el, "frq=", (uint32_t)rsr("cntfrq_el0"));
-	con_str("BUF0", "this buffer is RED  (paint #0)");
-	con_set_dy(FB_H);
-	con_set_row(6);
-	con_hex2("BUF1", "el=", (uint32_t)el, "frq=", (uint32_t)rsr("cntfrq_el0"));
-	con_str("BUF1", "this buffer is BLUE (paint #1)");
-	con_set_dy(0);
-	con_str("HOLD", "buffer id test: reset in 30s");
-	delay_ms(30000);
-	reset(1);
-#endif
-	con_set_dy(0);
-	con_clear(0xff000040U);	/* plain console: the combination that works */
-	con_set_row(1);
-	con_hex2("CPU", "el=", (uint32_t)el, "dtb=", (uint32_t)dtb);
-	con_hex2("FB", "w=", FB_W, "stride=", FB_STRIDE);
-	con_hex2("FBM", "h=", FB_H, "base=", (uint32_t)FB_BASE);
-	con_hex2("TIMER", "frq=", (uint32_t)rsr("cntfrq_el0"), "cnt=", (uint32_t)now());
-	con_str("SHIM", "rosemary milestone 4: xnu loader");
-	con_str("FB", "early framebuffer write complete");
-	__asm__ volatile("dsb sy" ::: "memory");
-
-	/* MT6785 rosemary: extend A7 WDT timeout and pet it before slow probes. */
-	stage = "watchdog";
-	con_hex2("WDT", "mode=", wdt_mode(), "len=", wdt_length());
-	wdt_init_long_timeout();
-	con_hex2("WDT", "now=", wdt_mode(), "len2=", wdt_length());
-	con_skip();
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
+	con_clear(RED);
+#ifdef ROSEMARY
+	con_str("SHIM", "rosemary XNU loader");
+	con_hex2("WDT", "was=", wdt_before, "now=", rd32(0x10007000UL));
+	con_skip();
+#else
+	con_str("SHIM", "sweet milestone 4: xnu loader");
+#endif
+	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: diagnostic build. Hold this frame, then reset.
-	 * The reboot *delay* is the blind debug channel: a reboot ~30 s after
-	 * power-on proves this code ran; a reboot after 5-7 s means LK never
-	 * handed control to us (image rejected / AVB / decompression). */
-	stage = "hold";
-	con_str("HOLD", "no xnu payload: reset in 30s");
-	con_str("BUF", "mirroring frame into the second mtkfb buffer");
-	con_mirror_second();
-	delay_ms(30000);
-	reset(1);
+	/* UFS is only present on sweet; rosemary uses eMMC and has no storage
+	 * driver in this shim yet. */
+#ifndef ROSEMARY
+	stage = "ufs";
+	test_ufs();
+	con_skip();
+	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
+	con_str("UFS", "probe done, reset in ~3 min");
+	delay_ms(180000);
+	reset(20);
+#else
+	con_str("STORAGE", "rosemary eMMC driver pending");
+	con_skip();
+#endif
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);
@@ -669,7 +435,11 @@ void shim_main(uint64_t dtb, uint64_t el)
 	if (rc)
 		con_clear(RED);
 
-	con_str("SHIM", "rosemary milestone 3");
+#ifdef ROSEMARY
+	con_str("SHIM", "rosemary MMU/GIC");
+#else
+	con_str("SHIM", "sweet milestone 3");
+#endif
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);

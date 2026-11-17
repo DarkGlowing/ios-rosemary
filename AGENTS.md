@@ -1,4 +1,4 @@
-# Working on ios-rosemary
+# Working on ios-sweet
 
 - Read `NOTES.md` before starting; it contains the project goal, hardware facts,
   current blocker, local artifact locations and the next concrete action.

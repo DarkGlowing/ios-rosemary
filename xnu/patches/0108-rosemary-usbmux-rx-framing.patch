@@ -1,0 +1,192 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -192,6 +192,7 @@
+ #define RU_TX_BUFFER_OFF          0x10000u
+ #define RU_USB_POLL_MS            1u
+ #define RU_MUX_TXQ_DEPTH          8u
++#define RU_MUX_RX_ACCUM_MAX       65536u
+ #define RU_MUX_TX_FRAME_MAX       2048u
+ #define RU_MUX_HOST_IP            0xc6120001u /* 198.18.0.1: synthetic USB peer */
+ #define RU_MUX_DEVICE_IP          0xc6120002u /* 198.18.0.2: local TCP services */
+@@ -230,6 +231,9 @@
+ 	uint16_t mux_ip_id;
+ 	uint32_t mux_tcp_in_count, mux_tcp_out_count;
+ 	uint32_t txq_head, txq_count;
++	uint32_t mux_rx_accum_len;
++	uint8_t mux_rx_accum[RU_MUX_RX_ACCUM_MAX];
++	uint8_t rx_packet_copy[RU_RX_CAPACITY];
+ 	struct {
+ 		uint16_t len;
+ 		uint8_t data[RU_MUX_TX_FRAME_MAX];
+@@ -1127,6 +1131,7 @@
+ 	ru.mux_state = RU_MUX_WAIT_VERSION;
+ 	ru.mux_tx_seq = 0;
+ 	ru.mux_rx_seq = 0xffffu;
++	ru.mux_rx_accum_len = 0;
+ 	lck_mtx_unlock(ru.tx_lock);
+ }
+ 
+@@ -1173,7 +1178,12 @@
+ {
+ 	struct rosemary_usbmux_frame frame;
+ 	uint32_t wire_version = ru.mux_version;
+-	int parsed = rosemary_usbmux_parse(packet, len, wire_version, &frame);
++	int parsed;
++	/* QMU can restart after SET_CONFIGURATION while the host remains on v2.
++	 * The v2 magic identifies the wire header even if local state was reset. */
++	if (wire_version < 2u && len >= RUMUX_V2_HEADER_SIZE &&
++	    rosemary_usbmux_get_be32(packet + 8) == RUMUX_MAGIC_V2) wire_version = 2u;
++	parsed = rosemary_usbmux_parse(packet, len, wire_version, &frame);
+ 
+ 	if (parsed != 0) {
+ 		if (ru.rx_packets <= 8u) {
+@@ -1212,13 +1222,28 @@
+ 		return;
+ 	}
+ 
++	/* A valid v2 SETUP can arrive after QMU/configuration reset the local state. */
++	if (ru.mux_state == RU_MUX_WAIT_VERSION && wire_version >= 2u &&
++	    frame.protocol == RUMUX_PROTO_SETUP && frame.payload_len == 1u &&
++	    frame.payload[0] == 0x07u) {
++		lck_mtx_lock(ru.tx_lock);
++		ru.mux_version = 2u;
++		ru.mux_rx_seq = frame.tx_seq;
++		ru.mux_tx_seq = 0u;
++		ru.mux_state = RU_MUX_ACTIVE;
++		lck_mtx_unlock(ru.tx_lock);
++		printf("ROSEMARY USB: USBMUX v2 SETUP accepted after QMU state reset (tx_seq=%u rx_seq=%u)\n",
++		    frame.tx_seq, frame.rx_seq);
++		return;
++	}
++
+ 	/* QMU can occasionally miss the first short OUT transfer after VERSION.
+ 	 * usbmuxd normally sends v2 SETUP (tx_seq 0) before opening Lockdown, so
+ 	 * recover only if the next observed frame is a valid SYN to port 62078.
+ 	 * This is a guarded diagnostic recovery path, not a replacement for fixing
+ 	 * the underlying OUT-queue handoff. */
+-	if (ru.mux_state == RU_MUX_WAIT_SETUP &&
+-	    frame.protocol == RUMUX_PROTO_TCP &&
++	if ((ru.mux_state == RU_MUX_WAIT_SETUP || ru.mux_state == RU_MUX_WAIT_VERSION) &&
++	    wire_version >= 2u && frame.protocol == RUMUX_PROTO_TCP &&
+ 	    frame.payload_len >= sizeof(struct tcphdr)) {
+ 		struct tcphdr first_tcp;
+ 		uint32_t first_tcp_hlen = (uint32_t)((frame.payload[12] >> 4) & 0x0fu) * 4u;
+@@ -1229,11 +1254,12 @@
+ 		    first_tcp_hlen >= sizeof(struct tcphdr) &&
+ 		    first_tcp_hlen <= frame.payload_len) {
+ 			lck_mtx_lock(ru.tx_lock);
++			ru.mux_version = 2u;
+ 			ru.mux_rx_seq = frame.tx_seq;
+ 			ru.mux_tx_seq = 0u;
+ 			ru.mux_state = RU_MUX_ACTIVE;
+ 			lck_mtx_unlock(ru.tx_lock);
+-			printf("ROSEMARY USB: USBMUX SETUP not observed; resync on Lockdown SYN %u->%u muxseq=%u\n",
++			printf("ROSEMARY USB: USBMUX state resynchronized on Lockdown SYN %u->%u muxseq=%u\n",
+ 			    ntohs(first_tcp.th_sport), ntohs(first_tcp.th_dport), frame.tx_seq);
+ 			(void)ru_mux_tcp_input(frame.payload, frame.payload_len);
+ 			return;
+@@ -1270,6 +1296,69 @@
+ 	}
+ }
+ 
++/* Treat bulk OUT completions as a byte stream rather than assuming each QMU
++ * completion contains one whole USBMUX frame. This also recognizes v2 magic
++ * even if endpoint reconfiguration reset the negotiated-version variable. */
++static void ru_mux_rx_feed(const uint8_t *packet, uint32_t len)
++{
++	if (packet == NULL || len == 0u) return;
++	if (ru.mux_rx_accum_len > RU_MUX_RX_ACCUM_MAX ||
++	    len > RU_MUX_RX_ACCUM_MAX - ru.mux_rx_accum_len) {
++		printf("ROSEMARY USB: USBMUX RX accumulator overflow used=%u incoming=%u; resetting\n",
++		    ru.mux_rx_accum_len, len);
++		ru.mux_rx_accum_len = 0;
++		if (len > RU_MUX_RX_ACCUM_MAX) return;
++	}
++	bcopy(packet, ru.mux_rx_accum + ru.mux_rx_accum_len, len);
++	ru.mux_rx_accum_len += len;
++
++	while (ru.mux_rx_accum_len >= RUMUX_V1_HEADER_SIZE) {
++		const uint8_t *buf = ru.mux_rx_accum;
++		uint32_t protocol = rosemary_usbmux_get_be32(buf);
++		uint32_t total = rosemary_usbmux_get_be32(buf + 4);
++		uint32_t header_len;
++
++		if (ru.mux_version >= 2u ||
++		    (ru.mux_rx_accum_len >= RUMUX_V2_HEADER_SIZE &&
++		     rosemary_usbmux_get_be32(buf + 8) == RUMUX_MAGIC_V2)) {
++			header_len = RUMUX_V2_HEADER_SIZE;
++		} else if (ru.mux_version == 1u ||
++		    (protocol == RUMUX_PROTO_VERSION && ru.mux_state == RU_MUX_WAIT_VERSION)) {
++			header_len = RUMUX_V1_HEADER_SIZE;
++		} else if (ru.mux_rx_accum_len < RUMUX_V2_HEADER_SIZE) {
++			/* Wait for enough bytes to distinguish a v2 header from v1. */
++			return;
++		} else {
++			header_len = RUMUX_V1_HEADER_SIZE;
++		}
++
++		if (total < header_len || total > RU_MUX_RX_ACCUM_MAX) {
++			printf("ROSEMARY USB: USBMUX invalid frame header proto=%u total=%u used=%u header=%u\n",
++			    protocol, total, ru.mux_rx_accum_len, header_len);
++			ru.mux_rx_accum_len = 0;
++			return;
++		}
++		/* If the 17-byte SETUP lost its final 07 but the next frame is already
++		 * buffered, do not consume that next frame's first byte as SETUP data. */
++		if (header_len == RUMUX_V2_HEADER_SIZE && protocol == RUMUX_PROTO_SETUP &&
++		    total == 17u && ru.mux_rx_accum_len > total && buf[16] != 0x07u &&
++		    (ru.mux_state == RU_MUX_WAIT_SETUP || ru.mux_state == RU_MUX_WAIT_VERSION)) {
++			printf("ROSEMARY USB: incomplete USBMUX SETUP; resyncing stream boundary\n");
++			ru.mux_rx_accum_len -= RUMUX_V2_HEADER_SIZE;
++			memmove(ru.mux_rx_accum, ru.mux_rx_accum + RUMUX_V2_HEADER_SIZE,
++			    ru.mux_rx_accum_len);
++			continue;
++		}
++		if (ru.mux_rx_accum_len < total) return;
++		ru_mux_rx_packet(buf, total);
++		ru.mux_rx_accum_len -= total;
++		if (ru.mux_rx_accum_len != 0u) {
++			memmove(ru.mux_rx_accum, ru.mux_rx_accum + total, ru.mux_rx_accum_len);
++		}
++	}
++}
++
++
+ /* Parse each completed USB OUT transfer before re-arming the DMA buffer. */
+ static void ru_rx_poll(void)
+ {
+@@ -1293,14 +1382,15 @@
+ 	}
+ 	ru_dma_sync(RU_RX_BUFFER_OFF, RU_RX_CAPACITY);
+ 	ru.rx_packets++;
+-	if (len != 0u) {
+-		ru_mux_rx_packet((const uint8_t *)(ru.dma + RU_RX_BUFFER_OFF), len);
+-	}
++	/* Preserve the completed data, then re-arm OUT before parsing/stack input. */
++	if (len != 0u) bcopy((const void *)(ru.dma + RU_RX_BUFFER_OFF), ru.rx_packet_copy, len);
+ 	if (!ru_rx_arm()) {
+ 		ru.rx_errors++;
+ 		ru.rx_active = 0;
+ 		printf("ROSEMARY USB: RX QMU re-arm failed\n");
++		return;
+ 	}
++	if (len != 0u) ru_mux_rx_feed(ru.rx_packet_copy, len);
+ }
+ 
+ static int ru_qmu_init(void)
+@@ -1493,12 +1583,12 @@
+ 		}
+ 
+ 		if (ru.configuration != ru.seen_configuration) {
++			/* Drain old QMU state before reconfiguring the same endpoints. */
++			if (ru.rx_active || ru.tx_active) ru_qmu_shutdown();
+ 			if (ru.configuration != 0u) {
+ 				if (!ru_qmu_init()) {
+ 					printf("ROSEMARY USB: QMU endpoint startup failed\n");
+ 				}
+-			} else if (ru.rx_active) {
+-				ru_qmu_shutdown();
+ 			}
+ 			ru.seen_configuration = ru.configuration;
+ 		}

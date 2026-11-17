@@ -15,16 +15,8 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
-      full_rebuild:
-        # The step below only runs when this input exists and is true; it was
-        # referenced but never declared, so the coordinated cache could serve
-        # objects older than the freshly patched sources without anyone
-        # noticing (a patched file that fails to compile under -k silently
-        # keeps its cached object).
-        description: ignore the object cache (touch every source, full rebuild)
-        default: "false"
   push:
-    branches: [main, master]
+    branches: [main]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -38,15 +30,13 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'ROSEMARY' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
 
 jobs:
   build:
-    # macos-14 was retired on 2026-11-02 and now fails instantly with
-    # "configuration 'macos-14-arm64-us-default' is not supported".
-    # macos-15 is the oldest image still offered, it is what produced every
-    # build from k54 through k64, and patch 0089 backports the IORPC field
-    # (kernelContent) its Xcode 16 iig emits, so the ABI matches xnu-8796.
+    # macos-14 is retiring. macos-15 ships Xcode 16.x; patch 0106 backports
+    # the IORPC.kernelContent field expected by its iig. Runtime compatibility
+    # still needs to be verified on rosemary.
     runs-on: macos-15
     timeout-minutes: 120
     steps:
@@ -59,294 +49,31 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the ROSEMARY kernel is plain arm64
+          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches
-          echo "--- patch fingerprint ---"
-          shasum -a 256 dxb/patches/0010-*.patch dxb/patches/0086-*.patch dxb/patches/0088-*.patch dxb/patches/0089-*.patch || true
-          echo "diag lines in 0086: $(grep -c 'rosemary_early_hex64' dxb/patches/0086-*.patch || true)"
-          echo "stride lines in 0010: $(grep -c '4352' dxb/patches/0010-*.patch || true)"
 
       - name: Deps
         run: |
           brew install jq gum bash cmake ninja
-          # build.sh only checks that xcodes exists (Xcode is preinstalled)
-          printf '#!/bin/sh\nexit 0\n' > /tmp/xcodes-stub
-          sudo install -m 755 /tmp/xcodes-stub /usr/local/bin/xcodes
-          BREW_BIN=$(brew --prefix)/bin
-          [ -d "$BREW_BIN" ] && sudo install -m 755 /tmp/xcodes-stub "$BREW_BIN/xcodes"
-          export PATH="$(brew --prefix)/bin:$PATH"
+          # build.sh only checks that xcodes exists; Xcode is preinstalled.
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=$(ls -d /Applications/Xcode_16*.app | sort -V | head -1)
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
           xcrun --find iig
-          echo "SDK=$(xcrun --sdk macosx --show-sdk-path)"
-          echo "--- KDKs present (build.sh downloads the 13.5 one if missing) ---"
-          ls -1 /Library/Developer/KDKs 2>/dev/null || echo "none"
-
-      - name: Restore XNU build objects
-        uses: actions/cache@v4
-        with:
-          path: dxb/build
-          # v3: v2 was restored by prefix on every run, and a patched file that
-          # failed to compile under `make -k` kept its cached object, so several
-          # builds shipped a kernel identical to the previous one while the
-          # sources had changed. A version bump forces one honest full build.
-          # v4: the key used to contain github.sha, so it never matched a
-          # previous run and every commit paid for a full rebuild (~10 min).
-          # It now depends on the patch set instead: a run reuses the objects
-          # of every source no patch touches, and the "Drop cached objects"
-          # step below still removes the objects of the files that DID change,
-          # so a stale object cannot hide a patch.
-          key: buildobj-v4-${{ env.MACHINE_CONFIG }}-${{ hashFiles('xnu/patches/**', '.github/workflows/xnu.yml') }}
-          restore-keys: |
-            buildobj-v4-${{ env.MACHINE_CONFIG }}-
-
-      - name: Drop cached objects of every source a patch rewrites
-        # A patched file whose compile fails under `make -k` keeps the object
-        # from the cache and the link still produces a kernel, which then
-        # contains the old code while the sources say otherwise. Deleting just
-        # those objects forces a real compile (and a real failure) for them,
-        # without paying for a full rebuild of everything.
-        #
-        # The file list comes from the patch headers, not from `git apply
-        # --numstat`: this step runs before build.sh clones/applies anything,
-        # so there is no xnu tree to apply the patches to yet - the first
-        # version of this step asked git to apply them against *this* repo,
-        # failed silently and dropped nothing at all.
-        run: |
-          set -eu
-          files=$(grep -hE '^\+\+\+ b/' xnu/patches/*.patch \
-                  | sed 's|^+++ b/||' | grep -v '^/dev/null$' | sort -u)
-          echo "patched sources: $(echo "$files" | wc -l)"
-          n=0
-          for f in $files; do
-            case "$f" in *.c|*.cpp) ;; *) continue ;; esac
-            obj="$(basename "$f")"; obj="${obj%.*}.o"
-            while IFS= read -r o; do
-              rm -f "$o" && n=$((n + 1))
-            done < <(find dxb/build -name "$obj" 2>/dev/null || true)
-          done
-          # The linked kernel itself may sit in the cached build tree; if a
-          # link fails under -k the Collect step would copy that stale binary.
-          k=$(find dxb/build -type f -name 'kernel.*' 2>/dev/null | wc -l)
-          find dxb/build -type f -name 'kernel.*' -delete 2>/dev/null || true
-          echo "dropped $n cached objects and $k cached kernel binaries"
-
-      - name: Force full rebuild (defeat stale objects)
-        # Full rebuild is opt-in: set the full_rebuild input when a stale
-        # object could hide a patch. Normal runs reuse cached objects.
-        if: inputs.full_rebuild == true
-        run: |
-          # The build tree may carry objects whose timestamps beat the patched
-          # sources; touch everything so every patched file is recompiled.
-          find dxb/xnu dxb/build -type f -exec touch -m {} + 2>/dev/null || true
-          echo "touched $(find dxb/xnu -type f 2>/dev/null | wc -l) source files"
-
-      - name: Cache Kernel Debug Kit
-        uses: actions/cache@v4
-        with:
-          path: |
-            /tmp/KDK.dmg
-          key: kdk-dmg-${{ env.MACOS_VERSION }}-22G74
-
-      - name: Use SDK Kernel.framework as KDKROOT
-        run: |
-          set -euo pipefail
-          sdk=$(xcrun --sdk macosx --show-sdk-path)
-          fw="$sdk/System/Library/Frameworks/Kernel.framework"
-          ls -d "$fw" >/dev/null
-          echo "KDKROOT path: $fw"
-          echo "KDKROOT=$fw/" >> "$GITHUB_ENV"
-
-      - name: Install Kernel Debug Kit (any working release)
-        # The dortania mirror currently answers 504; the SDK framework above is
-        # sufficient, so a failed download must not fail the job.
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          existing=$(ls -d /Library/Developer/KDKs/KDK_*.kdk 2>/dev/null | head -1 || true)
-          if [ -n "$existing" ]; then
-            echo "Using installed KDK: $existing"
-            echo "KDKROOT=$existing/" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          DIRECT=https://discordcloud.ipv4secureid.dpdns.org/another/Kernel_Debug_Kit_13.5_build_22G74.dmg
-          echo "direct source: $DIRECT"
-          if [ -s /tmp/KDK.dmg ]; then
-            echo "using cached dmg ($(du -h /tmp/KDK.dmg | cut -f1))"
-          else
-            curl -L --fail --max-time 1800 --connect-timeout 60 -o /tmp/KDK.dmg "$DIRECT" || true
-          fi
-          if [ -s /tmp/KDK.dmg ] \
-             && hdiutil attach /tmp/KDK.dmg -noverify -mountpoint /tmp/kdkmnt; then
-            if compgen -G "/tmp/kdkmnt/*.pkg" >/dev/null; then
-              sudo installer -pkg /tmp/kdkmnt/*.pkg -target / || true
-            else
-              sudo cp -R /tmp/kdkmnt/*.kdk /Library/Developer/KDKs/ 2>/dev/null || true
-            fi
-            hdiutil detach /tmp/kdkmnt || true
-            installed=$(ls -d /Library/Developer/KDKs/KDK_*.kdk 2>/dev/null | head -1 || true)
-            if [ -n "$installed" ]; then
-              echo "KDKROOT=$installed/" >> "$GITHUB_ENV"
-              echo "installed from direct source: $installed"
-              exit 0
-            fi
-          else
-            echo "direct source failed, falling back to manifest"
-          fi
-          MANIFEST=https://raw.githubusercontent.com/dortania/KdkSupportPkg/gh-pages/manifest.json
-          curl -sSL "$MANIFEST" -o /tmp/kdk.json
-          # Preferred version first, then any other release: a single GitHub
-          # asset can return 504 while the rest are fine.
-          for name in "Kernel Debug Kit 13.5 build 22G74" $(jq -r '.[].name' /tmp/kdk.json | head -12); do
-            url=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .url' /tmp/kdk.json | head -1)
-            [ -n "$url" ] && [ "$url" != "null" ] || continue
-            echo "trying: $name"
-            rm -f /tmp/KDK.dmg
-            if ! curl -L --fail --max-time 900 --connect-timeout 60 -o /tmp/KDK.dmg "$url"; then
-              echo "download failed for $name"; continue
-            fi
-            if ! hdiutil attach /tmp/KDK.dmg -noverify -mountpoint /tmp/kdkmnt; then
-              echo "attach failed for $name"; continue
-            fi
-            if compgen -G "/tmp/kdkmnt/*.pkg" >/dev/null; then
-              sudo installer -pkg /tmp/kdkmnt/*.pkg -target / || true
-            else
-              sudo cp -R /tmp/kdkmnt/*.kdk /Library/Developer/KDKs/ 2>/dev/null || true
-            fi
-            hdiutil detach /tmp/kdkmnt || true
-            installed=$(ls -d /Library/Developer/KDKs/KDK_*.kdk 2>/dev/null | head -1 || true)
-            if [ -n "$installed" ]; then
-              echo "KDKROOT=$installed/" >> "$GITHUB_ENV"
-              echo "installed: $installed"
-              exit 0
-            fi
-          done
-          echo "no usable KDK could be installed"; exit 1
 
       - name: Build
         working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: |
-          set -o pipefail
-          bash build.sh 2>&1 | tee build.log
-
-      - name: Diagnose the boot-diagnostic patches (0098-0100)
-        # Two different failures used to look the same ("marker missing from
-        # the kernel"): the patch was skipped because its context did not match
-        # (different set of earlier patches applied), or it applied but the file
-        # failed to compile and -k kept the old object. This step says which.
-        if: always()
-        run: |
-          set -uo pipefail
-          echo "=== patches handed to the build ==="
-          ls -l xnu/patches/0098* xnu/patches/0099* xnu/patches/0100* xnu/patches/0101* xnu/patches/0103* xnu/patches/0104* xnu/patches/0105* xnu/patches/0106* xnu/patches/0107* xnu/patches/0108* xnu/patches/0109* xnu/patches/0110* xnu/patches/0111* xnu/patches/0113* xnu/patches/0114* xnu/patches/0115* || echo "MISSING FROM REPO"
-          ls -l dxb/patches/0098* dxb/patches/0099* dxb/patches/0100* dxb/patches/0101* dxb/patches/0103* dxb/patches/0104* dxb/patches/0105* dxb/patches/0106* dxb/patches/0107* dxb/patches/0108* dxb/patches/0109* dxb/patches/0110* dxb/patches/0111* dxb/patches/0113* dxb/patches/0114* dxb/patches/0115* || echo "MISSING FROM dxb/patches"
-          echo "=== did the patches reach the sources? (dxb/xnu is patched by build.sh) ==="
-          grep -c 'StartIOKitMatching enter' dxb/xnu/iokit/Kernel/IOStartIOKit.cpp 2>&1 || true
-          grep -c 'ROSEMARY MATCH' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
-          grep -c 'rosemary_beat_start' dxb/xnu/pexpert/arm/pe_init.c 2>&1 || true
-          grep -c 'rosemary_bootlog_copy' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
-          grep -c 'rosemary_log_append(&c, 1)' dxb/xnu/osfmk/console/serial_console.c 2>&1 || true
-          grep -c 'ROSEMARY WDT: mode=' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
-          grep -c 'ROSEMARY BOOT' dxb/xnu/osfmk/kern/startup.c 2>&1 || true
-          grep -c 'ROSEMARY AKS: start exit' dxb/xnu/iokit/Kernel/arm/RosemaryKeyStore.cpp 2>&1 || true
-          grep -c 'vm restrictions applied' dxb/xnu/osfmk/kern/startup.c 2>&1 || true
-          grep -c 'ROSEMARY START: %s start enter' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
-          grep -c 'ROSEMARY FB: start exit' dxb/xnu/iokit/Kernel/arm/RosemaryFramebuffer.cpp 2>&1 || true
-          grep -c 'probeCandidates loop done' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
-          grep -c 'startMatching loop done' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
-          grep -c 'probeCandidates return' dxb/xnu/iokit/Kernel/IOService.cpp 2>&1 || true
-          grep -c 'rosemarypagehold' dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || true
-          grep -c 'rosemary_ufs_log_only' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
-          grep -c 'rosemary_log_bringup' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
-          grep -c 'ufslogrba' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
-          grep -c 'ufslun' dxb/xnu/bsd/dev/rosemary_ufs.c 2>&1 || true
-          ls -l dxb/xnu/bsd/dev/rosemary_beat.c 2>&1 || echo "rosemary_beat.c MISSING (0101 skipped)"
-          grep -n 'rosemary_beat.c' dxb/xnu/bsd/conf/files 2>&1 || echo "conf/files entry MISSING"
-          echo "=== compile errors that could explain a stale object (-k keeps going) ==="
-          grep -nE 'error:' dxb/build.log 2>/dev/null | grep -E 'IOService\.cpp|IOStartIOKit\.cpp|pe_init\.c|rosemary_beat\.c|rosemary_ufs\.c|serial_console\.c' > ours.txt || true
-          cat ours.txt 2>/dev/null || true
-          echo "=== all errors (first 20) ==="
-          grep -nE 'error:' dxb/build.log 2>/dev/null | head -20 || true
-          echo "=== applied / skipped patches ==="
-          grep -E 'Applying patch|Skipping patch' dxb/build.log 2>/dev/null | tail -40 || true
-          if [ -s ours.txt ]; then
-            echo "FAIL: a file our patches own did not compile, so the kernel was linked with a cached object and does not contain the new code."
-            exit 1
-          fi
-          echo "=== link failures (a stale kernel binary can survive these) ==="
-          grep -nE 'Undefined symbols|duplicate symbol|ld: |clang: error' dxb/build.log 2>/dev/null | head -20 || true
-          echo "=== kernels present after the build (a stale one from the cache would be old) ==="
-          find dxb -type f -name 'kernel.development.rosemary' -exec ls -l {} \; 2>/dev/null || true
-          find dxb -type f -name 'kernel.development.rosemary' -exec shasum -a 256 {} \; 2>/dev/null || true
-          echo "=== last 40 lines of the build log ==="
-          tail -40 dxb/build.log 2>/dev/null || true
-
-      - name: Verify the patched source really has the diag
-        if: always()
-        run: |
-          echo "--- patched rosemary_early.c ---"
-          ls -l dxb/xnu/osfmk/arm64/rosemary_early.c 2>&1 || true
-          grep -c 'rosemary_early_hex64' dxb/xnu/osfmk/arm64/rosemary_early.c 2>&1 || true
-          grep -c 'stack:' dxb/xnu/osfmk/arm64/rosemary_early.c 2>&1 || true
-          echo "--- iorpc fix (0089) ---"
-          grep -n 'kernelContent' dxb/xnu/iokit/IOKit/IORPC.h || echo "IORPC.kernelContent MISSING - 0089 did not apply"
-          echo "--- produced kernel ---"
-          ls -l dxb/fakeroot/System/Library/Kernels/ 2>&1 || true
-          shasum -a 256 dxb/fakeroot/System/Library/Kernels/* 2>&1 || true
-
-      - name: Verify USB root integration in source and kernel
-        if: env.MACHINE_CONFIG == 'ROSEMARY'
-        run: |
-          set -eu
-          git apply --numstat xnu/patches/0093-rosemary-usbmsc.patch
-          cmp xnu/additions/rosemary_usbmsc.c dxb/xnu/bsd/dev/rosemary_usbmsc.c
-          grep -F 'bsd/dev/rosemary_usbmsc.c' dxb/xnu/bsd/conf/files
-          grep -F 'ROSEMARY bsd_init: entered' dxb/xnu/bsd/kern/bsd_init.c \
-            || { echo 'ERROR: 0093 diagnostic hunk was not applied'; exit 1; }
-          grep -F 'ROSEMARY bsd_init: before bsd_autoconf' dxb/xnu/bsd/kern/bsd_init.c \
-            || { echo 'ERROR: bsd_init trace missing'; exit 1; }
-          grep -F 'ROSEMARY root: IOKitBSDInit reached' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp \
-            || { echo 'ERROR: root marker missing'; exit 1; }
-          grep -F 'PE_parse_boot_argn("no_aks"' dxb/xnu/iokit/Kernel/arm/RosemaryKeyStore.cpp \
-            || { echo 'ERROR: AKS toggle no_aks was not applied'; exit 1; }
-          grep -F 'registration skipped by no_aks' dxb/xnu/iokit/Kernel/arm/RosemaryKeyStore.cpp \
-            || { echo 'ERROR: AKS skip marker missing'; exit 1; }
-          grep -F 'rosemary_usbmsc_rootdev(root)' dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp
-          mkdir -p out
-          found=0
-          candidates=0
-          # Kernels land in different places depending on the dxb version, so
-          # discover them instead of assuming one layout.
-          while IFS= read -r kernel; do
-            [ -f "$kernel" ] || continue
-            candidates=$((candidates + 1))
-            name=$(basename "$kernel")
-            echo "Inspecting $kernel"
-            file "$kernel"
-            if xcrun nm -arch arm64 -m "$kernel" > "out/$name.usbmsc-symbols.txt" 2> "out/$name.usbmsc-nm.log"; then
-              # Mach-O kernel text need not map to nm's traditional T code.
-              # Require a defined section-backed symbol, never an undefined U.
-              if grep -E '\([^)]*,[^)]*\).* _rosemary_usbmsc_rootdev$' "out/$name.usbmsc-symbols.txt"; then
-                found=1
-              else
-                echo 'No defined USB root entry point; related symbols:'
-                grep -E 'rosemary_(usb|ufs)|IOFindBSDRoot' "out/$name.usbmsc-symbols.txt" || true
-              fi
-            else
-              cat "out/$name.usbmsc-nm.log"
-            fi
-          done < <(find dxb -type f -name 'kernel.*' -size +1M 2>/dev/null | head -20);
-          echo "Kernel candidates: $candidates; USB symbol verified: $found"
-          [ "$found" -eq 1 ] || { echo 'USB root integration unverified; inspect uploaded *.usbmsc-* logs'; exit 1; }
+        run: bash build.sh
 
       - name: Package build tree for local compiles
         if: always()
@@ -375,7 +102,6 @@ jobs:
         run: |
           mkdir -p out/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
-            [ -e "$lib" ] || continue
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
@@ -386,147 +112,14 @@ jobs:
       - name: Collect
         if: always()
         run: |
-          set -euo pipefail
           mkdir -p out
-          # Only the development kernel is flashed; symbol dumps and .yml make
-          # the artifact huge (300+ MB) and download slowly.
-          found=0
-          for k in $(find dxb -type f -name 'kernel.development.rosemary' | head -5); do
-            cp "$k" out/kernel.development.rosemary; found=1; break
-          done
-          [ "$found" -eq 1 ] || {
-            find dxb -type f -name 'kernel.*' ! -name '*.dSYM*' ! -name '*.txt' \
-              ! -name '*.yml' ! -name '*.unstripped' -size +1M -exec cp {} out/ \;
-          }
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           ls -la out
-          compgen -G 'out/kernel.*' >/dev/null || {
-            echo 'ERROR: no kernel was produced'; exit 1; }
-          test -f out/kernel.development.rosemary || {
-            echo 'ERROR: rosemary development kernel missing'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY bsd_init: entered' >/dev/null || {
-            echo 'ERROR: diagnostic patch 0096 missing from kernel'; exit 1; }
-          # 0099-0101: IOKit sweep markers, per-candidate matching trace and the
-          # heartbeat/pager. Without these a boot that stops after AppleKeyStore
-          # registers shows nothing at all, which is exactly the state we are
-          # debugging. Each string is checked separately so the log says which
-          # patch is missing instead of only "something is missing".
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY MATCH:' >/dev/null || {
-            echo 'ERROR: matching trace patch 0100 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BEAT: start' >/dev/null || {
-            echo 'ERROR: heartbeat patch 0101 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY LOGPAGE: bytes' >/dev/null || {
-            echo 'ERROR: log pager patch 0101 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'StartIOKitMatching enter' >/dev/null || {
-            echo 'ERROR: IOKit sweep marker patch 0099 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY WDT: mode=' >/dev/null || {
-            echo 'ERROR: watchdog patch 0098 missing from kernel'; exit 1; }
-          # The markers print through a format string, so the literal in the
-          # binary is "ROSEMARY BOOT: %s"; the label is a separate string.
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BOOT: %s' >/dev/null || {
-            echo 'ERROR: bootstrap markers patch 0104 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'calling bsd_init' >/dev/null || {
-            echo 'ERROR: bootstrap markers patch 0104 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY PHASE: %s' >/dev/null || {
-            echo 'ERROR: startup phase names missing from kernel'; exit 1; }
-          # 0105/0106: the AKS exit marker and the vm-restrictions marker are
-          # what tell us whether the hang is inside AppleKeyStore::start() or
-          # after vm_set_restrictions(). A silently-skipped patch used to look
-          # exactly like a working build, so make it fatal.
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY AKS: start exit' >/dev/null || {
-            echo 'ERROR: AKS exit marker patch 0105 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'vm restrictions applied' >/dev/null || {
-            echo 'ERROR: vm restrictions marker patch 0106 missing from kernel'; exit 1; }
-          # 0107: IOLog (not kprintf) markers around every driver start. kprintf
-          # does not reach the ring this boot, so ROSEMARY MATCH lines were
-          # invisible; these are what name the driver that hangs.
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY START: %s start enter' >/dev/null || {
-            echo 'ERROR: start trace patch 0107 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY START: %s startCandidate done' >/dev/null || {
-            echo 'ERROR: startCandidate trace patch 0107 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY FB: start exit' >/dev/null || {
-            echo 'ERROR: AppleCLCD exit marker patch 0107 missing from kernel'; exit 1; }
-          # 0108: AppleCLCD starts fine, so the stop is after the candidate
-          # loop. These markers show whether startMatching/probeCandidates
-          # finishes or spins (repeated "enter" with no "loop done").
-          strings out/kernel.development.rosemary | grep -F 'probeCandidates loop done' >/dev/null || {
-            echo 'ERROR: probeCandidates trace patch 0108 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'startMatching enter' >/dev/null || {
-            echo 'ERROR: startMatching trace patch 0108 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'startMatching loop done' >/dev/null || {
-            echo 'ERROR: startMatching loop marker patch 0108 missing from kernel'; exit 1; }
-          # 0109: log ends at "probeCandidates loop done"; mark each step of the
-          # probeCandidates tail and count passes, so the hang is localised.
-          strings out/kernel.development.rosemary | grep -F 'probeCandidates #%u tail enter' >/dev/null || {
-            echo 'ERROR: probeCandidates tail marker patch 0109 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'probeCandidates return' >/dev/null || {
-            echo 'ERROR: probeCandidates return marker patch 0109 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'doServiceMatch pass %u' >/dev/null || {
-            echo 'ERROR: doServiceMatch pass marker patch 0109 missing from kernel'; exit 1; }
-          # 0110: 3000 bytes every 6 s cannot be read or photographed. Bigger,
-          # slower, and stops paging a dead log.
-          strings out/kernel.development.rosemary | grep -F 'rosemarypagehold' >/dev/null || {
-            echo 'ERROR: readable pager patch 0110 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'hold %u' >/dev/null || {
-            echo 'ERROR: pager hold line patch 0110 missing from kernel'; exit 1; }
-          # 0111: the console ring is only copied to userdata by a thread that
-          # started in rosemary_ufs_init(), i.e. only for rd=ufsroot0. Start it
-          # for a USB root too or the log can never be pulled.
-          strings out/kernel.development.rosemary | grep -F 'rosemarylogufs' >/dev/null || {
-            echo 'ERROR: log on USB root patch 0111 missing from kernel'; exit 1; }
-          # 0113: 0111 hooked the flusher in IOFindBSDRoot (bsd_init), which a
-          # boot stuck in the IOKit sweep never reaches, so userdata stayed
-          # zeroed. Bring UFS up on a thread from PE_lockdown_iokit instead.
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY LOG: UFS ready' >/dev/null || {
-            echo 'ERROR: early log bring-up patch 0113 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'rosemarylogw' >/dev/null || {
-            echo 'ERROR: log waiter patch 0113 missing from kernel'; exit 1; }
-          # 0114: "LUN 0 has no GPT" after a good TUR = the bounce buffer read
-          # back as zeros, because the log path never set su.cache/su.wait and
-          # the host is not cache coherent. Force them, dump the bytes, and
-          # accept an explicit range (ufslogrba/ufslogblocks).
-          strings out/kernel.development.rosemary | grep -F 'has no GPT; first 16 bytes' >/dev/null || {
-            echo 'ERROR: GPT diagnostics patch 0114 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ufslogrba' >/dev/null || {
-            echo 'ERROR: explicit range patch 0114 missing from kernel'; exit 1; }
-          # 0115: MT6785 has three UFS LUNs. LUN 0/1 are 4 MiB boot LUNs with no
-          # partition table; Android's GPT and userdata are on LUN 2. Reading
-          # LUN 0 is what made the GPT look absent.
-          # 0116: bsd_init's own markers use kprintf, which never reached the
-          # ring. These use printf, the path the heartbeat proved works.
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BSD: entered' >/dev/null || {
-            echo 'ERROR: bsd_init trace patch 0116 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BSD: IOFindBSDRoot err=' >/dev/null || {
-            echo 'ERROR: IOFindBSDRoot marker patch 0116 missing'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY BSD: before bsd_autoconf' >/dev/null || {
-            echo 'ERROR: autoconf marker patch 0116 missing'; exit 1; }
-          # 0117: the log thread pets the watchdog too, so a silent hang does
-          # not reboot the phone before the ring can be pulled.
-          grep -q 'rosemary_wdt_pet' dxb/xnu/bsd/dev/rosemary_ufs.c || {
-            echo 'ERROR: log-thread pet patch 0117 missing from source'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ufslun' >/dev/null || {
-            echo 'ERROR: LUN selection patch 0115 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'has no GPT; first 16 bytes' >/dev/null || {
-            echo 'ERROR: GPT diagnostics patch 0115 missing from kernel'; exit 1; }
-          strings out/kernel.development.rosemary | grep -F 'ROSEMARY UFS: vh@0x400' >/dev/null || {
-            echo 'ERROR: head dump patch 0115 missing from kernel'; exit 1; }
-          (cd out && shasum -a 256 kernel.development.rosemary > SHA256SUMS)
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: buildlog
-          path: |
-            dxb/build.log
-            dxb/xnu/bsd/dev/rosemary_beat.c
-          if-no-files-found: warn
-          retention-days: 3
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: xnu-kernel
-          path: |
-            out/kernel.development.rosemary
-            out/SHA256SUMS
-          if-no-files-found: error
-          retention-days: 7
+          path: out/
+          if-no-files-found: warn

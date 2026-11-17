@@ -1,19 +1,8 @@
-# ios-rosemary — iOS 16 on Redmi Note 10S (rosemary, MediaTek Helio G95 / MT6785) --- In The Development (not working yet)...
-
-> **Port of [ios-sweet](https://github.com/dipa-studio/ios-sweet) (Redmi Note 10 Pro / Qualcomm) to the Redmi Note 10S (`rosemary`, MediaTek MT6785).**
-> The project is still in hardware bring-up. The GIC mapping in the supplied `boot_a.bin` DTB has been verified and corrected; display handoff and a successful XNU/iOS boot on this target are not yet demonstrated by the supplied materials. Touch, keys, battery and USB also require target-specific validation or MediaTek driver work. **Read [PORTING_ROSEMARY.md](PORTING_ROSEMARY.md) and the current handoff at the top of [NOTES.md](NOTES.md) first.**
->
-> The rest of this README is inherited from `ios-sweet` and describes the Snapdragon Redmi Note 10 Pro. It is historical reference only, not a rosemary status report or safe set of device instructions. **Do not copy its flashing commands. For rosemary bring-up use temporary `fastboot boot` tests only; do not `fastboot flash` partitions as part of console diagnosis.**
-
----
-
-* Bugs: black screen, bug on mtkclient with stop line at sending emi data from shim-boot.img to backup android boot.img (fastboot flash boot boot.img - fix it)
-
-# ios-rosemary
+# ios-sweet
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`rosemary`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
 
 As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
 
@@ -56,11 +45,11 @@ ABL (stock Xiaomi bootloader, unlocked)
               -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
 ```
 
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x7bd20000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/rosemary-log-pull.sh`, so you don't have to film the screen.
+There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
 
 ## How to do it yourself
 
-You need a Redmi Note 10 Pro (`rosemary`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
+You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
 
 ### 0. Back up the phone
 
@@ -77,8 +66,8 @@ python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot
 The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
 
 ```sh
-gh workflow run xnu.yml -R YOU/ios-rosemary
-gh run download RUN_ID -R YOU/ios-rosemary -n xnu-kernel -D xnu/out
+gh workflow run xnu.yml -R YOU/ios-sweet
+gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
 ```
 
 To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
@@ -92,12 +81,12 @@ Download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple. Then, o
 tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
 sudo fsck.hfsplus -fy ios16-root.img
 sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-sudo python3 tools/rosemary-root-tweaks.py /mnt/iosroot
+sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
 sudo umount /mnt/iosroot
 img2simg ios16-root.img ios16-root.simg
 ```
 
-`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `rosemary-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
+`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `sweet-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
 
 The device tree builder copies `/product` from the real iPhone X device tree, which MobileGestalt needs. Extract it once, without downloading the whole IPSW:
 
@@ -111,9 +100,9 @@ ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im
 Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
 
 ```sh
-python3 tools/mkadt.py shim/out/rosemary.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.rosemary shim/out/rosemary.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 rosemaryfb_noconsole=1 rosemaryfb_hz=30'
+python3 tools/mkadt.py shim/out/sweet.adt --highmem
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
 shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
 ```
 
@@ -125,9 +114,9 @@ What the less obvious boot-args do:
 | `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
 | `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
 | `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
-| `rosemaryfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
-| `rosemaryfb_hz=30` | Panel refresh rate of the CPU copy |
-| `rosemarytouch=0`, `rosemarykeys=0` | Disable the touch or button driver |
+| `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
+| `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
+| `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
 
 ### 4. Flash the root and boot
 
@@ -143,15 +132,15 @@ The first boot takes about 4–5 minutes on the Apple logo, then the lock screen
 
 ```sh
 fastboot boot recovery/recovery.img        # OrangeFox, temporary
-tools/rosemary-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
+tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
 adb reboot bootloader
 ```
 
-The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `ROSEMARY ...` lines. `tools/rosemary-crash.py` symbolicates them against the shared cache.
+The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
 
 ### QEMU
 
-`tools/qemu-rosemary.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
+`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
 
 ## Repository layout
 
@@ -160,14 +149,14 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 | `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
 | `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
 | `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from rosemary's MMIO layout and the iPhone X identity |
+| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
 | `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
 | `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
-| `tools/rosemary-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
-| `tools/rosemary-log-pull.sh`, `rosemary-log.py` | Read the persistent kernel log from recovery |
-| `tools/rosemary-crash.py` | Symbolicate console crash reports |
+| `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
+| `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
+| `tools/sweet-crash.py` | Symbolicate console crash reports |
 | `tools/xnu-cc.py` | Local single-file compile check from a CI log |
-| `tools/qemu-rosemary.py` | QEMU test boots with framebuffer text decoding |
+| `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
 | `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
 
@@ -177,7 +166,7 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 
 | # | What |
 | --- | --- |
-| 0001–0009 | Toolchain compatibility, ROSEMARY machine config, non-PAC arm64, stubs for Apple-internal pieces |
+| 0001–0009 | Toolchain compatibility, SWEET machine config, non-PAC arm64, stubs for Apple-internal pieces |
 | 0010–0018 | Early framebuffer console, physmap fix, PRNG without corecrypto, device-tree platform expert, timer PPI, boot CPU driver |
 | 0019–0020 | Apple open-source libpthread kernel provider; BearSSL AES |
 | 0021–0027 | RAM-disk root, mockfs, SHA-256, minimal AMFI, Apple open-source HFS+, MD5 |
@@ -200,7 +189,7 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 
 ## Key hardware facts
 
-- RAM: payloads use the upper bank, `0x100000000` + `0xbfc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
+- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
 - GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
 - PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
 - Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.

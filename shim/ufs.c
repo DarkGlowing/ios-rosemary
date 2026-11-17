@@ -13,7 +13,7 @@
 #include "console.h"
 #include "ufs.h"
 
-#define UFS_BASE	0x11270000UL	// rosemary: ufshci@11270000 (MediaTek UFSHCI, standard JEDEC regs), M-PHY at ufs_mphy@11fa0000
+#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
@@ -83,12 +83,6 @@ static uint32_t be32(const uint8_t *p)
  * Issue one SCSI command (read direction or no data) in slot 0.
  * Returns 0 on success, otherwise a code describing the failure stage.
  */
-static int g_dir = 1;	/* 1 = data in (read), 2 = data out (write) */
-/* A UFS device exposes several logical units. On rosemary LU0 is a tiny boot
- * LU; the GPT and every partition live on another one, so every LBA we pass
- * has to go to the LU that actually carries the partition table. */
-static uint8_t g_lun;
-
 static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t len,
     uint32_t *ocs_out, uint32_t *status_out)
 {
@@ -98,7 +92,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 
 	/* Command UPIU: header (12 bytes), expected length, CDB. */
 	ucd.cmd[0] = 0x01;			/* transaction type: COMMAND */
-	ucd.cmd[1] = len ? (g_dir == 2 ? 0x20 : 0x40) : 0x00;	/* flags: W or R */
+	ucd.cmd[1] = len ? 0x40 : 0x00;		/* flags: R (data in) */
 	ucd.cmd[2] = lun;
 	ucd.cmd[3] = ++tag;
 	ucd.cmd[12] = len >> 24;
@@ -109,7 +103,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 		ucd.cmd[16 + i] = cdb[i];
 
 	uintptr_t ucd_pa = (uintptr_t)&ucd;
-	utrl[0].dw0 = (1u << 28) | ((len ? (g_dir == 2 ? 1u : 2u) : 0u) << 25) | (1u << 24);
+	utrl[0].dw0 = (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24);	/* UFS storage, dev->host */
 	utrl[0].dw2 = 0x0f;			/* OCS: invalid until the host updates it */
 	utrl[0].ucdba = (uint32_t)ucd_pa;
 	utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
@@ -126,7 +120,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	ufs_wr(REG_UTRLDBR, 1);
 	uint64_t start = ticks();
 	while (ufs_rd(REG_UTRLDBR) & 1) {
-		if (ticks() - start > 13000000) {	// 1 s @ 13 MHz (MediaTek CNTFRQ)
+		if (ticks() - start > 19200000) {	/* 1 s */
 			ufs_wr(REG_UTRLCLR, ~1u);	/* clear slot 0 (write 0 to the bit) */
 			return 1;			/* timeout */
 		}
@@ -141,34 +135,11 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	return *status_out ? 4 : 0;
 }
 
-/* SCSI SYNCHRONIZE CACHE(10): commit whatever the device still holds in its
- * volatile write cache. Without it a watchdog reset a few milliseconds later
- * discards our writes -- the device acknowledges them, and even serves the
- * read-back verification from cache, yet nothing ever reaches NAND. */
-static int flush_cache(void)
-{
-	uint8_t cdb[10] = { 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-	uint32_t ocs = 0, st = 0;
-	g_dir = 2;
-	int rc = scsi(g_lun, cdb, sizeof(cdb), 0, 0, &ocs, &st);
-	g_dir = 1;
-	return rc ? -1 : 0;
-}
-
-int ufs_flush(void)
-{
-	static int taken;
-	if (!taken) {
-		return 0;
-	}
-	return flush_cache();
-}
-
 static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
 {
 	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
 	uint32_t ocs, st;
-	return scsi(g_lun, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
+	return scsi(0, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
 }
 
 static uint64_t le64(const uint8_t *p)
@@ -221,59 +192,8 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 	}
 }
 
-/*
- * rosemary (MT6785) UFS pre-init: enable clocks, assert+release the host-side
- * resets and bring up the M-PHY PLL. lk leaves most of this running, but doing
- * it again is harmless and guarantees the link is up before we probe. Register
- * values taken from the rosemary Android kernel (ufs-mtk-platform.c,
- * clk-mt6785.c). Called at the very start of test_ufs().
- */
-#define INFRACFG_AO_BASE	0x10001000UL
-#define INFRA2_CG_CLR		0x0A8	/* clear power-down = enable clock */
-#define INFRA3_CG_CLR		0x0C4
-#define  UFS_CG_BITS		((1u<<28)|(1u<<29)|(1u<<30))	/* UFS, AES_UFSFDE, UFS_TICK */
-#define  UFS_AXI_CG_BIT		(1u<<5)
-#define UFS_MPHY_BASE		0x11fa0000UL	/* ufs_mphy (verify: mediatek,ufs_mphy reg) */
-
-static inline uint32_t io_rd(uintptr_t a) { return *(volatile uint32_t *)a; }
-static inline void io_wr(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
-static void udelay_ufs(unsigned us)
-{
-	uint64_t end = ticks() + 13000000ULL / 1000000 * us;
-	while (ticks() < end) ;
-}
-static void mtk_ufs_preinit(void)
-{
-	/* 1. Enable UFS clocks (clear power-down bits). Idempotent: if lk already
-	 * enabled them, these writes are no-ops. */
-	io_wr(INFRACFG_AO_BASE + INFRA2_CG_CLR, UFS_CG_BITS);
-	io_wr(INFRACFG_AO_BASE + INFRA3_CG_CLR, UFS_AXI_CG_BIT);
-	udelay_ufs(20);
-	/* 2. M-PHY PLL: release power-down/isolation bits (release = set/clear
-	 * the same bits lk already released; no-op if already up). Exact
-	 * sequence from ufs-mtk-platform.c. Reset sequence is INTENTIONALLY
-	 * skipped: lk leaves the link up, and re-asserting reset could drop it. */
-	volatile uint8_t *mphy = (volatile uint8_t *)UFS_MPHY_BASE;
-	uint32_t v;
-	v = io_rd((uintptr_t)mphy + 0x008C); io_wr((uintptr_t)mphy + 0x008C, v | (1u<<11));
-	v = io_rd((uintptr_t)mphy + 0x008C); io_wr((uintptr_t)mphy + 0x008C, v & ~(1u<<10));
-	v = io_rd((uintptr_t)mphy + 0x008C); io_wr((uintptr_t)mphy + 0x008C, v & ~(1u<<9));
-	v = io_rd((uintptr_t)mphy + 0x008C); io_wr((uintptr_t)mphy + 0x008C, v & ~(1u<<8));
-	v = io_rd((uintptr_t)mphy + 0xB044); io_wr((uintptr_t)mphy + 0xB044, v | (1u<<18));
-	v = io_rd((uintptr_t)mphy + 0xB044); io_wr((uintptr_t)mphy + 0xB044, v & ~(1u<<17));
-	v = io_rd((uintptr_t)mphy + 0xB044); io_wr((uintptr_t)mphy + 0xB044, v & ~(1u<<20));
-	v = io_rd((uintptr_t)mphy + 0xB044); io_wr((uintptr_t)mphy + 0xB044, v & ~(1u<<19));
-	v = io_rd((uintptr_t)mphy + 0xA0AC); io_wr((uintptr_t)mphy + 0xA0AC, v | (1u<<1));
-	v = io_rd((uintptr_t)mphy + 0xA0AC); io_wr((uintptr_t)mphy + 0xA0AC, v & ~(1u<<0));
-	udelay_ufs(1);
-	v = io_rd((uintptr_t)mphy + 0xA09C); io_wr((uintptr_t)mphy + 0xA09C, v & ~(1u<<18));
-	udelay_ufs(200);
-	con_str("UFS", "mtk pre-init: clocks+MPHY PLL release done");
-}
-
 void test_ufs(void)
 {
-	mtk_ufs_preinit();
 	con_str("UFS", "milestone 5 probe (read-only)");
 	uint32_t cap = ufs_rd(REG_CAP), hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
 	con_hex2("UFS", "ver=", ufs_rd(REG_VER), "cap=", cap);
@@ -343,110 +263,4 @@ void test_ufs(void)
 	if (esz != 128 || nent > 128)
 		return;
 	list_partitions(elba, nent);
-}
-
-
-/* -------------------------------------------------------------------------
- * Write support (used only for the debug log in expdb, never for anything
- * that matters on the device).
- * ---------------------------------------------------------------------- */
-
-/* Bring the host up and take over the transfer request list. Returns 0 if our
- * list is really in use (same conditions test_ufs() checks before issuing
- * commands), otherwise a negative code. */
-static int ufs_takeover(void)
-{
-	mtk_ufs_preinit();
-	uint32_t hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
-	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY))
-		return -1;
-	if (ufs_rd(REG_UTRLDBR))
-		return -2;
-	ufs_wr(REG_UTRLRSR, 0);
-	uintptr_t list = (uintptr_t)utrl;
-	ufs_wr(REG_UTRLBA, (uint32_t)list);
-	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
-	ufs_wr(REG_UTRLRSR, 1);
-	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || !(ufs_rd(REG_UTRLRSR) & 1))
-		return -3;
-	for (int i = 0; i < 3; i++) {
-		uint32_t ocs = 0, st = 0;
-		static const uint8_t tur[6] = { 0x00 };
-		g_dir = 0;
-		if (!scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st))
-			break;
-	}
-	g_dir = 1;
-	return 0;
-}
-
-static int write_blocks(uint32_t lba, const void *buf, uint32_t blocks)
-{
-	uint32_t ocs = 0, st = 0;
-	uint8_t cdb[10] = { 0x2A, 0, lba >> 24, lba >> 16, lba >> 8, lba,
-			    0, blocks >> 8, blocks, 0 };
-	g_dir = 2;
-	uint32_t rc = scsi(g_lun, cdb, sizeof(cdb), (void *)buf, blocks * BLOCK, &ocs, &st);
-	g_dir = 1;
-	return rc ? -1 : 0;
-}
-
-/* Write `bytes` (multiple of 4096) at lba. Verifies by reading the first block
- * back, and flips the UFSHCI data-direction encoding if the first attempt is
- * rejected. Returns 0 on success. */
-/* Find the logical unit that carries the GPT: read LBA 1 of each LU and look
- * for "EFI PART". Returns the LU index, or -1 when none answers (in which case
- * g_lun stays 0 and we behave exactly as before). */
-int ufs_probe_lun(void)
-{
-	static uint8_t blk[4096] __attribute__((aligned(4096)));
-	static int taken;
-
-	if (!taken) {
-		if (ufs_takeover()) {
-			return -1;
-		}
-		taken = 1;
-	}
-	int found = -1;
-	for (uint8_t lun = 0; lun < 4 && found < 0; lun++) {
-		uint8_t cdb[10] = { 0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0 };
-		uint32_t ocs = 0, st = 0;
-		g_dir = 1;
-		if (scsi(lun, cdb, sizeof(cdb), blk, BLOCK, &ocs, &st)) {
-			continue;
-		}
-		if (blk[0] == 'E' && blk[1] == 'F' && blk[2] == 'I' && blk[3] == ' ' &&
-		    blk[4] == 'P' && blk[5] == 'A' && blk[6] == 'R' && blk[7] == 'T') {
-			found = lun;
-		}
-	}
-	if (found >= 0) {
-		g_lun = (uint8_t)found;
-	}
-	return found;
-}
-
-int ufs_write_raw(uint32_t lba, const void *buf, uint32_t bytes)
-{
-	static int taken;
-	int rc = taken ? 0 : ufs_takeover();
-	if (rc)
-		return rc;
-	taken = 1;
-	uint32_t blocks = bytes / BLOCK;
-	if (write_blocks(lba, buf, blocks))
-		return -10;
-	if (flush_cache())
-		return -13;
-	if (read_blocks(lba, 1, data))
-		return -11;
-	/* Compare the whole first block, not just a prefix: a device that silently
-	 * truncates or mis-addresses the write has to be caught here. */
-	const uint8_t *s = (const uint8_t *)buf;
-	uint32_t n = bytes < BLOCK ? bytes : BLOCK;
-	for (uint32_t i = 0; i < n; i++)
-		if (s[i] != data[i])
-			return -12;
-	return 0;
 }

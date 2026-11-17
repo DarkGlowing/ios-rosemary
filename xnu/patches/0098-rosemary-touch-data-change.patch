@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/rosemary_touch.c b/bsd/dev/rosemary_touch.c
+index f07eb91..17403e0 100644
+--- a/bsd/dev/rosemary_touch.c
++++ b/bsd/dev/rosemary_touch.c
+@@ -45,11 +45,12 @@ void rosemary_touch_init(void);
+ #define FT_ADDR         0x38u
+ #define MT6360_LDO      0x64u
+ #define HALF_US         3u
+-#define RELEASE_MS      80u
++#define RELEASE_MS      100u
+ 
+ static vm_offset_t gpio;
+ static int touch_chan;
+ static unsigned p_scl, p_sda;
++static unsigned rel_ms = RELEASE_MS;
+ 
+ static inline uint32_t
+ grd(uint32_t off)
+@@ -316,7 +317,7 @@ ft_probe(void)
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+-	int delay_s = 12, logn = 120;
++	int delay_s = 12, logn = 400;
+ 	bool active[10] = { false };
+ 	unsigned errors = 0, polls = 0;
+ 
+@@ -324,6 +325,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("rosetouchdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("rosetouchlog", &logn, sizeof(logn));
++	(void)PE_parse_boot_argn("rosetouchrel", &rel_ms, sizeof(rel_ms));
+ 	for (int i = 0; i < delay_s; i++) {
+ 		sleep_ms(1000);
+ 	}
+@@ -394,9 +396,6 @@ touch_thread(void *arg, wait_result_t result)
+ 		if (i2c_read(FT_ADDR, &zero, 1, buf, 3 + 6 * n)) {
+ 			continue;
+ 		}
+-		if (edge) {
+-			event = true;
+-		}
+ 		for (int i = 0; i < n; i++) {
+ 			const uint8_t *p = buf + 3 + 6 * i;
+ 			int flag = p[0] >> 6;
+@@ -419,21 +418,21 @@ touch_thread(void *arg, wait_result_t result)
+ 				memcpy(prev, p, 6);
+ 				if (logn > 0) {
+ 					logn--;
+-					printf("ROSEMARY TOUCH: frame n=%d p0 %02x %02x %02x %02x int=%u\n", n, p[0], p[1], p[2], p[3], lvl);
++					printf("ROSEMARY TOUCH: frame n=%d p0 %02x %02x %02x %02x %02x %02x int=%u\n", n, p[0], p[1], p[2], p[3], p[4], p[5], lvl);
+ 				}
+ 			}
+ 			if (event || active[id]) {
+ 				if (event) {
+ 					last_event = now_ns;
+ 				}
+-				if (now_ns - last_event < RELEASE_MS * NSEC_PER_MSEC) {
++				if (now_ns - last_event < rel_ms * NSEC_PER_MSEC) {
+ 					active[id] = true;
+ 					sweet_hid_touch(id, 1, x, y);
+ 				}
+ 			}
+ 		}
+ check_release:
+-		if (now_ns - last_event >= RELEASE_MS * NSEC_PER_MSEC) {
++		if (now_ns - last_event >= rel_ms * NSEC_PER_MSEC) {
+ 			for (int i = 0; i < 10; i++) {
+ 				if (active[i]) {
+ 					active[i] = false;
