@@ -30,7 +30,7 @@
  	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
  	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
  	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
-@@ -127,6 +143,14 @@
+@@ -127,9 +143,19 @@
  {
  	const ml_topology_info_t *topology = ml_get_topology_info();
  	uint32_t requested = 1;
@@ -43,9 +43,16 @@
 +		return;
 +	}
  	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
- 	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
- 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
-@@ -150,6 +174,18 @@
+-	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+-	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
++	/* Fingerprint: the first line of every boot tells which driver build is
++	 * actually running, so a stale boot image cannot masquerade as a fix. */
++	IOLog("SWEET CPU: startAll pass=%u guards=0164 requested=%u selected=%u (limit=%u)\n",
++	    pass, requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
+ 
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+@@ -150,6 +176,18 @@
  	}
  	for (unsigned int i = 0; i < topology->num_cpus; i++) {
  		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
