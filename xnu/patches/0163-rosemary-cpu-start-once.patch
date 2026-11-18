@@ -1,0 +1,46 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -24,6 +24,17 @@
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+ static uint32_t sweet_cpus_registered;
++/*
++ * IOKit matches the CPU nubs more than once: the boot console shows the whole
++ * "cpu_start() ... 6/6 CPUs initialized" round, then platform expert and the
++ * device-tree services publish, and the round starts again. The second pass
++ * re-registered processors that were already running and the boot stopped for
++ * good on the first secondary it touched (console ended at "cpu=1 mpidr=0x100
++ * came alive", then the watchdog reset the phone). Both entry points are made
++ * idempotent here: a logical CPU that already has an instance is left alone,
++ * and startAll runs at most once.
++ */
++static uint32_t sweet_start_all_done;
+ 
+ /* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
+ static int32_t
+@@ -73,6 +84,11 @@
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++	/* Second (and later) match of an already-registered CPU: nothing to do. */
++	if (__atomic_load_n(&sweet_cpus[cpu->cpu_id], __ATOMIC_ACQUIRE) != NULL) {
++		IOLog("SWEET CPU: cpu=%u already registered, extra match ignored\n", cpu->cpu_id);
++		return true;
++	}
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+@@ -127,6 +143,13 @@
+ {
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	uint32_t requested = 1;
++
++	/* One round only: the match pass can run again after the device tree is
++	 * published, and re-bringing-up live processors wedges the boot. */
++	if (__atomic_exchange_n(&sweet_start_all_done, 1, __ATOMIC_ACQ_REL) != 0) {
++		IOLog("SWEET CPU: startAll already ran, second pass ignored\n");
++		return;
++	}
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
+ 	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
