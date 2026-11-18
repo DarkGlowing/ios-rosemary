@@ -3,7 +3,7 @@
 
 Only what the early boot path actually reads is emitted. Rosemary values are
 from the MT6785 DTS, the device's Android DTB snapshot, and on-device probes.
-Usage: mkadt_rosemary.py OUT.adt [--dump] [--qemu] [--highmem]
+Usage: mkadt_rosemary.py OUT.adt [--dump] [--qemu] [--highmem] [--cpus N]
 """
 import hashlib, os, struct, sys
 
@@ -76,7 +76,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, cpus=8):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
@@ -134,7 +134,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # as A76. Keep qcom,kryo470 first because reused XNU SweetCPU matches it.
     # The current SWEET XNU scheduler treats them as one SMP cluster.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
+    n_cpus = 1 if qemu else max(1, min(8, int(cpus)))
+    for core in range(n_cpus):
         arm_cpu = 'arm,cortex-a55' if qemu or core < 6 else 'arm,cortex-a76'
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
@@ -243,8 +244,12 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
 
 
 if __name__ == '__main__':
+    n_cpus = 8
+    if '--cpus' in sys.argv:
+        n_cpus = int(sys.argv[sys.argv.index('--cpus') + 1])
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv,
+                 cpus=n_cpus)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
