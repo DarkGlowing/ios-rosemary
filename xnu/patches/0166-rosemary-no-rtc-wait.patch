@@ -1,0 +1,22 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -78,9 +78,18 @@
+ 	t.tv_nsec = 0;
+ 
+ // RTC is not present on this target
+-#ifndef BCM2837
++#if !defined(BCM2837) && !defined(ROSEMARY)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
++#elif defined(ROSEMARY)
++	/*
++	 * No IORTC service exists on MT6785 (the wall clock lives in the PMIC
++	 * RTC behind mt6359, which nothing publishes here), so this wait always
++	 * burned its full 30 s and looked like a hang right after bsd_bufferinit
++	 * -- the last thing the console shows is "using N buffer headers". The
++	 * calendar is set from clock_initialize_calendar() below either way.
++	 */
++	(void)t;
+ #endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
