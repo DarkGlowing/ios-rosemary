@@ -1,0 +1,136 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -494,10 +494,30 @@
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
++#elif defined(ROSEMARY)
++/*
++ * kprintf does not reach the console on this board, only printf does, so the
++ * stock macro made bsd_init completely silent: every step it performs had to
++ * be guessed from whatever the following subsystem happened to print. On
++ * ROSEMARY the steps go out through printf, which the framebuffer console
++ * and the userdata log ring both receive.
++ */
++#define bsd_init_kprintf(x, ...) printf("bsd_init: " x, ## __VA_ARGS__)
+ #else
+ #define bsd_init_kprintf(x, ...)
+ #endif
+ 
++#if defined(ROSEMARY)
++	/*
++	 * Start petting the MT6785 watchdog before the first long step. Nothing
++	 * pets it once the bootloader is gone: the phone used to reset about
++	 * 30 s into bsd_init, which is the watchdog timeout, and the log simply
++	 * stopped mid-subsystem with no panic at all.
++	 */
++	extern void rosemary_wdt_start(void);
++	rosemary_wdt_start();
++#endif
++
+ 	throttle_init();
+ 
+ 	printf(copyright);
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -626,6 +626,71 @@
+  * from TWRP with tools/sweet-log-pull.sh. Needs ufsrw=1. Boot-args:
+  * sweetlog=0 disables it, ufslogsecs=<1..60> is the flush interval (default 10).
+  */
++/*
++ * MT6785 top-level watchdog (the block the bootloader arms). Nothing pets it
++ * after LK hands over, and its timeout is about 30 s: that is the "reset with
++ * no panic" the phone showed while bsd_init was still running. Pet it from a
++ * low-priority thread every second, which is far below the timeout and costs
++ * one MMIO write.
++ *
++ *   AP_WDT at 0x10007000, key 0x1971 in the upper half of the restart word.
++ */
++#define ROSEMARY_WDT_PA         0x10007000
++#define ROSEMARY_WDT_RESTART    0x08
++#define ROSEMARY_WDT_KEY        0x1971u
++#define ROSEMARY_WDT_SECS       1
++
++static vm_offset_t rosemary_wdt;
++static int rosemary_wdt_chan;
++static int rosemary_wdt_armed;
++
++void
++rosemary_wdt_pet(void)
++{
++	if (rosemary_wdt != 0) {
++		*(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_RESTART) =
++		    (ROSEMARY_WDT_KEY << 16) | 0x19;
++	}
++}
++
++static void
++rosemary_wdt_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		(void)tsleep(&rosemary_wdt_chan, PZERO, "rosemarywdt", hz * ROSEMARY_WDT_SECS);
++		rosemary_wdt_pet();
++	}
++}
++
++void
++rosemary_wdt_start(void)
++{
++	thread_t thread;
++	uint32_t on = 1;
++
++	if (rosemary_wdt_armed) {
++		return;
++	}
++	(void)PE_parse_boot_argn("rosemarywdt", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	rosemary_wdt_armed = 1;
++	rosemary_wdt = ml_io_map(ROSEMARY_WDT_PA, 0x1000);
++	if (rosemary_wdt == 0) {
++		printf("ROSEMARY WDT: cannot map 0x%x, watchdog left alone\n", ROSEMARY_WDT_PA);
++		return;
++	}
++	/* Pet once before the thread exists: the window until it runs is short. */
++	rosemary_wdt_pet();
++	if (kernel_thread_start(rosemary_wdt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("ROSEMARY WDT: petting 0x%x every %d s\n", ROSEMARY_WDT_PA, ROSEMARY_WDT_SECS);
++	} else {
++		printf("ROSEMARY WDT: cannot start pet thread\n");
++	}
++}
++
+ #define ROSEMARY_LOG_SIZE       (4u << 20)
+ #define ROSEMARY_LOG_BLOCKS     (1 + ROSEMARY_LOG_SIZE / UFS_BLOCK)
+ #define ROSEMARY_LOG_SECS       10u
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -683,11 +683,26 @@
+ 	assert(matching);
+ 	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
+ 
++#if defined(ROSEMARY)
++	/*
++	 * This stall gives the filesystems time to register on the IOBSD
++	 * resource. On this board the wait has never once been satisfied and it
++	 * costs a full 30 s -- the same 30 s the watchdog needs to reset the
++	 * phone -- so do not spend it: the built-in HFS+ registers from the
++	 * kernel itself and needs no time.
++	 */
++	if ((service = IOService::waitForMatchingService(matching, 0))) {
++		OSSafeReleaseNULL(service);
++	} else {
++		printf("ROSEMARY root: IOBSD resource not ready, continuing\n");
++	}
++#else
+ 	if ((service = IOService::waitForMatchingService(matching, 30ULL * kSecondScale))) {
+ 		OSSafeReleaseNULL(service);
+ 	} else {
+ 		IOLog("!BSD\n");
+ 	}
++#endif
+ 	matching->release();
+ 	matching = NULL;
+ 
