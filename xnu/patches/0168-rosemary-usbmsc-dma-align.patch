@@ -1,0 +1,87 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -23,6 +23,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define NT 32u
+ #define POOL_SIZE 0x100000u
++#define POOL_ALIGN 0x10000u
+ #define CMD 0x0000u
+ #define EVT 0x1000u
+ #define ERST 0x2000u
+@@ -720,15 +721,29 @@
+  if(!sc.usb||!sc.ippc||!sc.phy||!sc.infra||!sc.gpio){err=ENOMEM;goto out;}
+  printf("usbmsc: mmio mapped\n");
+  rosemary_usbmsc_stage=RS_STAGE_MMIO;
+- if(kmem_alloc_contig(kernel_map,&sc.pool,POOL_SIZE,0xffff,0,0,
++ /*
++  * kmem_alloc_contig()'s align argument constrains the *virtual* address
++  * only: the physical pages it returns are contiguous but not aligned, and
++  * the first boot that got here failed with ENOMEM because pa ended in
++  * 0xc000 while the check below wanted 64 KiB. Ask for an extra 64 KiB and
++  * slide the window to the first aligned physical address instead, which
++  * also keeps every structure inside the pool 64 KiB aligned.
++  */
++ if(kmem_alloc_contig(kernel_map,&sc.pool,POOL_SIZE+POOL_ALIGN,PAGE_MASK,0,0,
+     KMA_DATA|KMA_ZERO|KMA_PERMANENT,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS){err=ENOMEM;goto out;}
+  ppnum_t pn=pmap_find_phys(kernel_pmap,(addr64_t)sc.pool);
+- sc.pa=ptoa_64(pn);
+- printf("usbmsc: dma allocated va=%llx pa=%llx\n",(unsigned long long)sc.pool,(unsigned long long)sc.pa);
++ if(!pn){err=ENOMEM;goto out;}
++ uint64_t base_pa=ptoa_64(pn);
++ for(uint32_t off=0;off<POOL_SIZE+POOL_ALIGN;off+=PAGE_SIZE)
++  if(ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(sc.pool+off)))!=base_pa+off){err=ENOMEM;goto out;}
++ uint64_t aligned_pa=(base_pa+POOL_ALIGN-1)&~(uint64_t)(POOL_ALIGN-1);
++ sc.pool+=(uint32_t)(aligned_pa-base_pa);
++ sc.pa=aligned_pa;
++ printf("usbmsc: dma va=%llx pa=%llx (base pa=%llx, align %u)\n",
++   (unsigned long long)sc.pool,(unsigned long long)sc.pa,
++   (unsigned long long)base_pa,POOL_ALIGN);
+  rosemary_usbmsc_stage=RS_STAGE_DMA;
+- if(!pn||(sc.pa&0xffff)){err=ENOMEM;goto out;}
+- for(uint32_t off=0;off<POOL_SIZE;off+=PAGE_SIZE)
+-  if(ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(sc.pool+off)))!=sc.pa+off){err=ENOMEM;goto out;}
++ if(sc.pa&(POOL_ALIGN-1)){err=ENOMEM;goto out;}
+  printf("usbmsc: native xHCI/BOT probe\n");
+  rosemary_usbmsc_stage=RS_STAGE_CONTROLLER;
+  err=enumerate();if(err)goto out;
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -683,11 +683,26 @@
+ 	assert(matching);
+ 	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
+ 
++#if defined(ROSEMARY)
++	/*
++	 * This stall gives the filesystems time to register on the IOBSD
++	 * resource. On this board the wait has never once been satisfied and it
++	 * costs a full 30 s -- the same 30 s the watchdog needs to reset the
++	 * phone -- so do not spend it: the built-in HFS+ registers from the
++	 * kernel itself and needs no time.
++	 */
++	if ((service = IOService::waitForMatchingService(matching, 0))) {
++		OSSafeReleaseNULL(service);
++	} else {
++		printf("ROSEMARY root: IOBSD resource not ready, continuing\n");
++	}
++#else
+ 	if ((service = IOService::waitForMatchingService(matching, 30ULL * kSecondScale))) {
+ 		OSSafeReleaseNULL(service);
+ 	} else {
+ 		IOLog("!BSD\n");
+ 	}
++#endif
+ 	matching->release();
+ 	matching = NULL;
+ 
+@@ -808,8 +823,9 @@
+ 			    rosemary_usbmsc_stage >= 9 ? "HFS+ volume ok" :
+ 			    rosemary_usbmsc_stage >= 7 ? "no HFS+ volume at lba2 or in a partition" :
+ 			    rosemary_usbmsc_stage >= 5 ? "xHCI port up, no device" :
+-			    rosemary_usbmsc_stage >= 3 ? "controller did not start" :
+-			    rosemary_usbmsc_stage >= 1 ? "MMIO/DMA setup" : "entry",
++			    rosemary_usbmsc_stage >= 4 ? "controller did not start" :
++			    rosemary_usbmsc_stage >= 3 ? "DMA pool" :
++			    rosemary_usbmsc_stage >= 2 ? "MMIO map" : "entry",
+ 			    rosemary_usbmsc_diag);
+ 		}
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
