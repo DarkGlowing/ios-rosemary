@@ -1,0 +1,96 @@
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -627,18 +627,33 @@
+  * sweetlog=0 disables it, ufslogsecs=<1..60> is the flush interval (default 10).
+  */
+ /*
+- * MT6785 top-level watchdog (the block the bootloader arms). Nothing pets it
+- * after LK hands over, and its timeout is about 30 s: that is the "reset with
+- * no panic" the phone showed while bsd_init was still running. Pet it from a
+- * low-priority thread every second, which is far below the timeout and costs
+- * one MMIO write.
++ * MT6785 top-level watchdog, TOPRGU at 0x10007000.
+  *
+- *   AP_WDT at 0x10007000, key 0x1971 in the upper half of the restart word.
++ * LK arms it and nothing pets it after the handover, so the phone resets about
++ * 25-30 s into bsd_init with no panic on the console. Register layout and keys
++ * are the ones the bootloader itself uses (U-Boot mtk_wdt.c, and this tree's
++ * own shim/shim.c, which clears EN before jumping to the kernel):
++ *
++ *   0x00 MODE     write key 0x22000000 | bits; bit 0 = enable
++ *   0x04 LENGTH   timeout
++ *   0x08 RESTART  write 0x1971 (the key is the whole value, not shifted)
++ *
++ * The first version of this code wrote (0x1971 << 16) | 0x19 to RESTART,
++ * which matches nothing in the hardware and petted nothing: the counter kept
++ * running and the reset stayed at the same place. The value is now 0x1971
++ * exactly, as in the bootloader.
++ *
++ * Boot-args:
++ *   rosemarywdt=0            do not touch the watchdog at all
++ *   rosemarywdtdisable=1     clear MODE.EN once (belt and braces, no rebuild)
+  */
+-#define ROSEMARY_WDT_PA         0x10007000
++#define ROSEMARY_WDT_PA         0x10007000u
++#define ROSEMARY_WDT_MODE       0x00
++#define ROSEMARY_WDT_LENGTH     0x04
+ #define ROSEMARY_WDT_RESTART    0x08
+-#define ROSEMARY_WDT_KEY        0x1971u
+-#define ROSEMARY_WDT_SECS       1
++#define ROSEMARY_WDT_MODE_KEY   0x22000000u
++#define ROSEMARY_WDT_RESTART_KEY 0x1971u
++#define ROSEMARY_WDT_HZ         1
+ 
+ static vm_offset_t rosemary_wdt;
+ static int rosemary_wdt_chan;
+@@ -649,7 +664,7 @@
+ {
+ 	if (rosemary_wdt != 0) {
+ 		*(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_RESTART) =
+-		    (ROSEMARY_WDT_KEY << 16) | 0x19;
++		    ROSEMARY_WDT_RESTART_KEY;
+ 	}
+ }
+ 
+@@ -657,7 +672,7 @@
+ rosemary_wdt_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	for (;;) {
+-		(void)tsleep(&rosemary_wdt_chan, PZERO, "rosemarywdt", hz * ROSEMARY_WDT_SECS);
++		(void)tsleep(&rosemary_wdt_chan, PZERO, "rosemarywdt", hz / ROSEMARY_WDT_HZ);
+ 		rosemary_wdt_pet();
+ 	}
+ }
+@@ -681,11 +696,30 @@
+ 		printf("ROSEMARY WDT: cannot map 0x%x, watchdog left alone\n", ROSEMARY_WDT_PA);
+ 		return;
+ 	}
+-	/* Pet once before the thread exists: the window until it runs is short. */
++
++	uint32_t mode = *(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_MODE);
++	uint32_t length = *(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_LENGTH);
++	printf("ROSEMARY WDT: mode=0x%x length=0x%x\n", mode, length);
++
++	/* Pet once immediately: the thread below is not running yet. */
+ 	rosemary_wdt_pet();
++
++	{
++		uint32_t disable = 0;
++		(void)PE_parse_boot_argn("rosemarywdtdisable", &disable, sizeof(disable));
++		if (disable) {
++			*(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_MODE) =
++			    ROSEMARY_WDT_MODE_KEY | (mode & ~(uint32_t)1);
++			__asm__ volatile("dsb sy" ::: "memory");
++			printf("ROSEMARY WDT: EN cleared, mode 0x%x -> 0x%x\n", mode,
++			    *(volatile uint32_t *)(rosemary_wdt + ROSEMARY_WDT_MODE));
++		}
++	}
++
+ 	if (kernel_thread_start(rosemary_wdt_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+-		printf("ROSEMARY WDT: petting 0x%x every %d s\n", ROSEMARY_WDT_PA, ROSEMARY_WDT_SECS);
++		printf("ROSEMARY WDT: petting 0x%x (key 0x%x) %d Hz\n",
++		    ROSEMARY_WDT_RESTART, ROSEMARY_WDT_RESTART_KEY, ROSEMARY_WDT_HZ);
+ 	} else {
+ 		printf("ROSEMARY WDT: cannot start pet thread\n");
+ 	}
