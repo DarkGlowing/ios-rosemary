@@ -1,0 +1,155 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -72,6 +72,11 @@
+  * what the port scan saw has to fit on the screen. */
+ char rosemary_usbmsc_diag[160] = "usbmsc: not reached";
+ 
++/* Writable root on the stick. On by default; usbmscrw=0 puts the driver back
++ * to read-only without a rebuild, which is the quick way back if writes turn
++ * out to upset the mount. */
++static bool usbmsc_rw = true;
++
+ struct usb_ring { uint32_t off, index, cycle; };
+ static struct {
+  vm_offset_t usb, op, rt, db, phy, ippc, infra, gpio, pool;
+@@ -524,16 +529,21 @@
+  return 0;
+ }
+ /* Single command at a time. On malformed/failed transport, fail closed:
+- * do not reuse an uncertain ring or issue a second CBW. No write commands. */
+-static int bot(const uint8_t *cdb,uint32_t cdblen,uint32_t length) {
++ * do not reuse an uncertain ring or issue a second CBW.
++ *
++ * in=true is a device-to-host transfer (READ), in=false is host-to-device
++ * (WRITE). BOT puts the direction in bmCBWFlags bit 7 and the same byte count
++ * in dCBWDataTransferLength; the data stage then runs on the matching bulk
++ * ring, which is why bulk() takes the direction too. */
++static int bot(const uint8_t *cdb,uint32_t cdblen,uint32_t length,bool in) {
+  if(sc.failed||length>DATA_SIZE||!cdblen||cdblen>16)return EIO;
+  uint32_t tag=++sc.tag,done=0;uint8_t *cbw=mem(CBW),*csw=mem(CSW);
+  bzero(cbw,64);bzero(csw,64);
+  put32(cbw,0x43425355);put32(cbw+4,tag);put32(cbw+8,length);
+- cbw[12]=0x80;cbw[13]=0;cbw[14]=(uint8_t)cdblen;bcopy(cdb,cbw+15,cdblen);
++ cbw[12]=in?0x80:0x00;cbw[13]=0;cbw[14]=(uint8_t)cdblen;bcopy(cdb,cbw+15,cdblen);
+  int err=bulk(false,CBW,31,&done);
+  if(err||done!=31)goto transport_fail;
+- if(length){err=bulk(true,DATA,length,&done);if(err||done!=length)goto transport_fail;}
++ if(length){err=bulk(in,DATA,length,&done);if(err||done!=length)goto transport_fail;}
+  err=bulk(true,CSW,13,&done);
+  if(err||done!=13||le32(csw)!=0x53425355||le32(csw+4)!=tag||
+     le32(csw+8)>length||csw[12]>2)goto transport_fail;
+@@ -545,12 +555,13 @@
+  sc.failed=true;printf("usbmsc: BOT transport stopped tag=%u err=%d bytes=%u\n",tag,err,done);
+  return err?err:EIO;
+ }
+-static int scsi(const uint8_t *cdb,uint32_t cdblen,uint32_t length) {
++static int scsi(const uint8_t *cdb,uint32_t cdblen,uint32_t length,bool in) {
+  for(unsigned attempt=0;attempt<3;attempt++) {
+-  int err=bot(cdb,cdblen,length);
++  int err=bot(cdb,cdblen,length,in);
+   if(!err||sc.failed)return err;
++  /* REQUEST SENSE is always an IN transfer. */
+   uint8_t sense[6]={3,0,0,0,18,0};
+-  err=bot(sense,6,18);if(err)return err;
++  err=bot(sense,6,18,true);if(err)return err;
+   uint8_t *s=mem(DATA);uint32_t response=s[0]&127;
+   if(response!=0x70&&response!=0x71)return EIO;
+   uint32_t key=s[2]&15,asc=s[12],ascq=s[13];
+@@ -563,7 +574,22 @@
+ static int read_blocks(uint64_t lba,uint32_t count) {
+  if(!count||count>DATA_SIZE/512||lba>0xffffffffull||lba>=sc.sectors||count>sc.sectors-lba)return EINVAL;
+  uint8_t c[10]={0x28,0,(uint8_t)(lba>>24),(uint8_t)(lba>>16),(uint8_t)(lba>>8),(uint8_t)lba,0,(uint8_t)(count>>8),(uint8_t)count,0};
+- return scsi(c,10,count*512);
++ return scsi(c,10,count*512,true);
++}
++/* WRITE(10) out of the DMA buffer. The caller copies the data into mem(DATA)
++ * first; bulk(OUT) cleans those lines to the point of coherency before the
++ * host controller reads them. */
++static int write_blocks(uint64_t lba,uint32_t count) {
++ if(!usbmsc_rw)return EROFS;
++ if(!count||count>DATA_SIZE/512||lba>0xffffffffull||lba>=sc.sectors||count>sc.sectors-lba)return EINVAL;
++ uint8_t c[10]={0x2a,0,(uint8_t)(lba>>24),(uint8_t)(lba>>16),(uint8_t)(lba>>8),(uint8_t)lba,0,(uint8_t)(count>>8),(uint8_t)count,0};
++ return scsi(c,10,count*512,false);
++}
++/* SYNCHRONIZE CACHE(10): the stick has its own write cache, and an HFS+ root
++ * that never flushed would lose the directory it had just updated. */
++static int sync_cache(void) {
++ uint8_t c[10]={0x35,0,0,0,0,0,0,0,0,0};
++ return scsi(c,10,0,false);
+ }
+ /* Validate an HFS+ volume header at base+2 and remember where the volume
+  * starts: a stick written with an iOS root image has it at absolute LBA 2,
+@@ -650,10 +676,10 @@
+ }
+ static int probe_disk(void) {
+  uint8_t inquiry[6]={0x12,0,0,0,36,0},cap[10]={0x25};
+- int err=scsi(inquiry,6,36);if(err)return err;
++ int err=scsi(inquiry,6,36,true);if(err)return err;
+  if((mem(DATA)[0]&31)!=0)return ENOTSUP;
+  rosemary_usbmsc_stage=RS_STAGE_PROBE;
+- err=scsi(cap,10,8);if(err)return err;
++ err=scsi(cap,10,8,true);if(err)return err;
+  uint32_t last=be32(mem(DATA)),size=be32(mem(DATA)+4);
+  if(last==0xffffffffu||size!=512)return ENOTSUP;
+  sc.sectors=(uint64_t)last+1;sc.blocksize=512;
+@@ -667,18 +693,26 @@
+  buf_setresid(bp,buf_count(bp));
+  lck_mtx_lock(&usbmsc_lock);
+  if(!sc.ready||sc.failed){err=ENXIO;goto out;}
+- if(!(buf_flags(bp)&B_READ)){err=EROFS;goto out;}
+  /* buf_blkno follows the logical block size negotiated by HFS. */
+  uint64_t factor=sc.blocksize/512;
+  if(block<0||(bytes&511)||((uint64_t)block>(sc.sectors-sc.base_lba)/factor)){err=EINVAL;goto out;}
+  uint64_t lba=(uint64_t)block*factor+sc.base_lba;
+  if(bytes/512>sc.sectors-lba){err=EINVAL;goto out;}
+- uint8_t *dest=(uint8_t *)(uintptr_t)buf_dataptr(bp);
+- if(!dest&&bytes){err=EINVAL;goto out;}
++ uint8_t *data=(uint8_t *)(uintptr_t)buf_dataptr(bp);
++ if(!data&&bytes){err=EINVAL;goto out;}
++ bool const writep=(buf_flags(bp)&B_READ)==0;
++ if(writep&&!usbmsc_rw){err=EROFS;goto out;}
+  while(bytes) {
+   uint32_t n=bytes>DATA_SIZE?DATA_SIZE:(uint32_t)bytes;
+-  err=read_blocks(lba,n/512);if(err)break;
+-  bcopy(mem(DATA),dest,n);dest+=n;lba+=n/512;bytes-=n;buf_setresid(bp,(int)bytes);
++  if(writep) {
++   bcopy(data,mem(DATA),n);
++   err=write_blocks(lba,n/512);
++  } else {
++   err=read_blocks(lba,n/512);
++   if(!err)bcopy(mem(DATA),data,n);
++  }
++  if(err)break;
++  data+=n;lba+=n/512;bytes-=n;buf_setresid(bp,(int)bytes);
+  }
+ out:
+  lck_mtx_unlock(&usbmsc_lock);if(err)buf_seterror(bp,err);buf_biodone(bp);
+@@ -694,10 +728,11 @@
+  case DKIOCSETBLOCKSIZE:
+   if(*v<512||*v>4096||(*v&(*v-1)))err=EINVAL;else sc.blocksize=*v;break;
+  case DKIOCGETBLOCKCOUNT:*q=(sc.sectors-sc.base_lba)*512/sc.blocksize;break;
+- case DKIOCISWRITABLE:*v=0;break;
+- case DKIOCSYNCHRONIZE:case DKIOCSYNCHRONIZECACHE:break;
++ case DKIOCISWRITABLE:*v=usbmsc_rw?1:0;break;
++ case DKIOCSYNCHRONIZE:case DKIOCSYNCHRONIZECACHE:
++  if(usbmsc_rw)err=sync_cache();break;
+  case DKIOCGETMAXBLOCKCOUNTREAD:*q=DATA_SIZE/sc.blocksize;break;
+- case DKIOCGETMAXBLOCKCOUNTWRITE:*q=0;break;
++ case DKIOCGETMAXBLOCKCOUNTWRITE:*q=usbmsc_rw?DATA_SIZE/sc.blocksize:0;break;
+  case DKIOCGETMAXSEGMENTCOUNTREAD:case DKIOCGETMAXSEGMENTCOUNTWRITE:*q=1;break;
+  default:err=ENOTTY;
+  }
+@@ -708,7 +743,12 @@
+  .d_strategy=usbmsc_strategy,.d_ioctl=usbmsc_ioctl,.d_psize=usbmsc_psize,.d_type=D_DISK};
+ int rosemary_usbmsc_rootdev(dev_t *dev) {
+  int enabled=1,err;PE_parse_boot_argn("usbmsc",&enabled,sizeof(enabled));
+- printf("usbmsc: root entry enabled=%d\n",enabled);
++ /* usbmscrw=0 keeps the driver read-only, which is the quick way back if
++  * writes ever make the mount worse: the switch lives in the payload, not in
++  * a rebuilt kernel. */
++ int rw=1;PE_parse_boot_argn("usbmscrw",&rw,sizeof(rw));
++ usbmsc_rw=(rw!=0);
++ printf("usbmsc: root entry enabled=%d writable=%d\n",enabled,usbmsc_rw?1:0);
+  rosemary_usbmsc_stage=RS_STAGE_ENTRY;
+  if(!enabled)return ENXIO;
+  lck_mtx_lock(&usbmsc_lock);
