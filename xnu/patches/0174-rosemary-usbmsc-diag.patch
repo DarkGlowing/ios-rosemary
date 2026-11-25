@@ -1,0 +1,53 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -690,6 +690,14 @@
+ }
+ static void usbmsc_strategy(struct buf *bp) {
+  uint64_t bytes=buf_count(bp);daddr64_t block=buf_blkno(bp);int err=0;
++#if defined(ROSEMARY)
++ /* The exec of /sbin/launchd fails with EINVAL and none of the kernel-side
++  * checks is responsible, so the file read path is the remaining suspect.
++  * Log the shape of every request that fails, which says whether the vnode
++  * layer is asking for something this driver refuses.
++  */
++ uint64_t d_bytes=bytes; daddr64_t d_block=block; uint32_t d_flags=buf_flags(bp);
++#endif
+  buf_setresid(bp,buf_count(bp));
+  lck_mtx_lock(&usbmsc_lock);
+  if(!sc.ready||sc.failed){err=ENXIO;goto out;}
+@@ -715,9 +723,21 @@
+   data+=n;lba+=n/512;bytes-=n;buf_setresid(bp,(int)bytes);
+  }
+ out:
++#if defined(ROSEMARY)
++ if(err) {
++  printf("ROSEMARY USBMSC: error=%d blk=%lld bytes=%llu flags=0x%x writep=%d\n",
++      err,(long long)d_block,(unsigned long long)d_bytes,d_flags,
++      (d_flags&B_READ)==0);
++ }
++#endif
+  lck_mtx_unlock(&usbmsc_lock);if(err)buf_seterror(bp,err);buf_biodone(bp);
+ }
+-static int usbmsc_open(__unused dev_t dev,__unused int f,__unused int t,__unused struct proc *p) {return sc.ready?0:ENXIO;}
++static int usbmsc_open(__unused dev_t dev,__unused int f,__unused int t,__unused struct proc *p) {
++#if defined(ROSEMARY)
++ if(!sc.ready)printf("ROSEMARY USBMSC: open refused, not ready\n");
++#endif
++ return sc.ready?0:ENXIO;
++}
+ static int usbmsc_close(__unused dev_t dev,__unused int f,__unused int t,__unused struct proc *p) {return 0;}
+ static int usbmsc_ioctl(__unused dev_t dev,u_long cmd,caddr_t data,__unused int flags,__unused struct proc *p) {
+  uint32_t *v=(uint32_t *)data;uint64_t *q=(uint64_t *)data;int err=0;
+@@ -734,7 +754,11 @@
+  case DKIOCGETMAXBLOCKCOUNTREAD:*q=DATA_SIZE/sc.blocksize;break;
+  case DKIOCGETMAXBLOCKCOUNTWRITE:*q=usbmsc_rw?DATA_SIZE/sc.blocksize:0;break;
+  case DKIOCGETMAXSEGMENTCOUNTREAD:case DKIOCGETMAXSEGMENTCOUNTWRITE:*q=1;break;
+- default:err=ENOTTY;
++ default:
++  err=ENOTTY;
++#if defined(ROSEMARY)
++  printf("ROSEMARY USBMSC: ioctl 0x%lx not handled\n",(unsigned long)cmd);
++#endif
+  }
+  lck_mtx_unlock(&usbmsc_lock);return err;
+ }
