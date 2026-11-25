@@ -1,0 +1,59 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -606,9 +606,20 @@ static int hfs_volume(uint64_t base,const char *where) {
+   uint32_t bs=be32(v+40),blocks=be32(v+44);
+   if(bs<512||bs>65536||(bs&(bs-1))||!blocks)return EIO;
+   if((uint64_t)bs*blocks>(sc.sectors-base)*512)return EIO;
+-  sc.base_lba=base;sc.blocksize=bs;
+-  printf("usbmsc: HFS%c base=%llu block=%u blocks=%u (read-only)\n",
+-      v[1],(unsigned long long)base,bs,blocks);
++  /*
++   * bs is the HFS *allocation* block size, not the block device's logical
++   * block size. The buffer cache numbers blocks in DEV_BSIZE (512) units,
++   * and the mount log confirms it ("could not use physical block size
++   * (4096) switching to 512"). Storing bs here multiplied every LBA by 8:
++   * the early metadata reads of the mount stayed inside the volume, but once
++   * exec asked for /sbin/launchd at 8.5 GB the LBA became 68 GB inside a
++   * 16 GB volume and the driver answered EINVAL.
++   *
++   * Keep the device block size at 512; bs is only logged.
++   */
++  sc.base_lba=base;
++  printf("usbmsc: HFS%c base=%llu allocblk=%u blocks=%u devblk=%u\n",
++      v[1],(unsigned long long)base,bs,blocks,sc.blocksize);
+   rosemary_usbmsc_stage=RS_STAGE_HFS;
+   return 0;
+  }
+@@ -703,6 +714,12 @@ static void usbmsc_strategy(struct buf *bp) {
+  if(!sc.ready||sc.failed){err=ENXIO;goto out;}
+  /* buf_blkno follows the logical block size negotiated by HFS. */
+  uint64_t factor=sc.blocksize/512;
++#if defined(ROSEMARY)
++ int dbg=0;
++ if(block<0){dbg=1;err=EINVAL;goto out;}
++ if(bytes&511){dbg=2;err=EINVAL;goto out;}
++ if((uint64_t)block>(sc.sectors-sc.base_lba)/factor){dbg=3;err=EINVAL;goto out;}
++#endif
+  if(block<0||(bytes&511)||((uint64_t)block>(sc.sectors-sc.base_lba)/factor)){err=EINVAL;goto out;}
+  uint64_t lba=(uint64_t)block*factor+sc.base_lba;
+  if(bytes/512>sc.sectors-lba){err=EINVAL;goto out;}
+@@ -728,6 +745,10 @@ out:
+   printf("ROSEMARY USBMSC: error=%d blk=%lld bytes=%llu flags=0x%x writep=%d\n",
+       err,(long long)d_block,(unsigned long long)d_bytes,d_flags,
+       (d_flags&B_READ)==0);
++  printf("ROSEMARY USBMSC: state sectors=%llu base=%llu blocksize=%u factor=%llu lba=%llu\n",
++      (unsigned long long)sc.sectors,(unsigned long long)sc.base_lba,
++      sc.blocksize,(unsigned long long)(sc.blocksize/512),
++      (unsigned long long)((uint64_t)d_block*(sc.blocksize/512)+sc.base_lba));
+  }
+ #endif
+  lck_mtx_unlock(&usbmsc_lock);if(err)buf_seterror(bp,err);buf_biodone(bp);
+@@ -817,7 +838,7 @@ int rosemary_usbmsc_rootdev(dev_t *dev) {
+  if(majorno<0){err=ENODEV;goto out;}
+  sc.dev=makedev(majorno,0);sc.ready=true;*dev=sc.dev;
+  rosemary_usbmsc_stage=RS_STAGE_READY;
+- printf("usbmsc: usbroot0 ready, read-only, major=%d\n",majorno);
++ printf("usbmsc: usbroot0 ready, %s, major=%d\n", usbmsc_rw?"read-write":"read-only", majorno);
+ out:
+  if(err) {
+   sc.failed=true;printf("usbmsc: attach failed errno=%d\n",err);
