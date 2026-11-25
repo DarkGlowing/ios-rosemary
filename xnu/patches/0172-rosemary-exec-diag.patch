@@ -1,0 +1,51 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1315,6 +1315,12 @@
+ 	 * Actually load the image file we previously decided to load.
+ 	 */
+ 	lret = load_machfile(imgp, mach_header, thread, &map, &load_result);
++#if defined(ROSEMARY)
++	if (lret != LOAD_SUCCESS) {
++		printf("ROSEMARY EXEC: load_machfile lret=%d errno=%d sz=%lld\n",
++		    (int)lret, load_return_to_errno(lret), (long long)imgp->ip_arch_size);
++	}
++#endif
+ 	if (lret != LOAD_SUCCESS) {
+ 		error = load_return_to_errno(lret);
+ 
+@@ -1768,6 +1774,13 @@
+ 		}
+ 		error = task_set_dyld_info(task, load_result.all_image_info_addr,
+ 		    load_result.all_image_info_size);
++#if defined(ROSEMARY)
++		if (error) {
++			printf("ROSEMARY EXEC: task_set_dyld_info failed addr=0x%llx sz=%llu\n",
++			    (unsigned long long)load_result.all_image_info_addr,
++			    (unsigned long long)load_result.all_image_info_size);
++		}
++#endif
+ 		if (error) {
+ 			vm_map_switch(old_map);
+ 
+@@ -6275,6 +6288,11 @@
+ 
+ #if CONFIG_MACF
+ 	error = mac_vnode_check_exec(imgp->ip_vfs_context, vp, imgp);
++#if defined(ROSEMARY)
++	if (error) {
++		printf("ROSEMARY EXEC: mac_vnode_check_exec=%d\n", error);
++	}
++#endif
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -6287,6 +6305,9 @@
+ 		action |= KAUTH_VNODE_READ_DATA;
+ 	}
+ 	if ((error = vnode_authorize(vp, NULL, action, imgp->ip_vfs_context)) != 0) {
++#if defined(ROSEMARY)
++		printf("ROSEMARY EXEC: vnode_authorize=%d\n", error);
++#endif
+ 		return error;
+ 	}
+ 
