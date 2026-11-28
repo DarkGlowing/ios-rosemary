@@ -1,0 +1,89 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -556,46 +556,67 @@
+ static int usbmsc_recover(void) {
+  printf("usbmsc: recovering BOT state\n");
+  /*
+-  * Order matters. control() itself drives the EP0 ring, so the rings have to
+-  * be rebuilt before any control transfer is attempted; doing it the other way
+-  * round ran the reset through a stale ring and the failure left sc.failed
+-  * set, which is how the previous attempt ended up locking the driver out of
+-  * every later request.
++  * This mirrors start_controller()'s bring-up exactly, because that is the
++  * only sequence proven to work on this controller. The previous version
++  * shifted the event-ring registers by 0x10 (ERSTSZ/ERSTBA/ERDP went to
++  * rt+0x10/0x18/0x20 instead of rt+0x08/0x10/0x18), so the event ring was
++  * never configured and every later command timed out as
++  * "timeout type=33 dci=0" -- command rings get answered only through that
++  * ring.
+   *
+-  * Every step below is best effort: whatever the device answers, the driver
+-  * clears sc.failed at the end and tries again. A disk that is really gone
+-  * will fail on the next transfer anyway.
++  *   rt + 0x00  IMAN     interrupt enable
++  *   rt + 0x04  IMOD     moderation
++  *   rt + 0x08  ERSTSZ   event ring segment table size
++  *   rt + 0x10  ERSTBA   segment table base (64-bit)
++  *   rt + 0x18  ERDP     dequeue pointer (64-bit)
+   */
+- /* 1. fresh rings */
++
++ /* 0. stop the controller before touching its memory */
++ wr(sc.op,0,0);
++ if(bits(sc.op,4,1,1,200000)) {
++  printf("usbmsc: recovery: controller did not halt\n");
++ }
++
++ /* 1. fresh rings and a valid DCBAA entry (the zeroing wipes it) */
+  bzero((void *)sc.pool,POOL_SIZE);
+- /* The zeroing above also wipes DCBAA, which has to point at this device's
+-  * output context slot again before the controller walks it. */
+  ((uint64_t *)mem(DCBAA))[sc.slot]=phys(OUTPUT);
+  clean(DCBAA,4096);
+  init_ring(&sc.cmd,CMD);init_ring(&sc.ep0,EP0);
+  init_ring(&sc.bin,BIN);init_ring(&sc.bout,BOUT);
+  sc.ei=0;sc.ec=1;sc.tag=0;
++
+  uint32_t *erst=(uint32_t *)mem(ERST);
+  erst[0]=(uint32_t)phys(EVT);erst[1]=(uint32_t)(phys(EVT)>>32);erst[2]=NT;
+  sync_dma(0,POOL_SIZE);
+- wr64(sc.op,0x18,phys(CMD)|1);wr64(sc.op,0x30,phys(DCBAA));
+- wr(sc.rt,0x10,2);wr(sc.rt,0x14,0);wr(sc.rt,0x18,1);
+- wr64(sc.rt,0x20,phys(ERST));wr64(sc.rt,0x28,phys(EVT));
+- /* Point every endpoint back at the start of its rebuilt ring. EP0 first:
+-  * the control transfers below are what needs it. */
++
++ /* 2. program the controller, same values and same order as bring-up */
++ wr64(sc.op,0x18,phys(CMD)|1);          /* CRCR, ring cycle 1 */
++ wr64(sc.op,0x30,phys(DCBAA));          /* DCBAAP */
++ wr(sc.op,0x38,sc.maxslots);            /* CONFIG */
++ wr(sc.rt,0,2);wr(sc.rt,4,0);wr(sc.rt,8,1);
++ wr64(sc.rt,0x10,phys(ERST));wr64(sc.rt,0x18,phys(EVT));
++ wr(sc.op,0,1);                         /* USBCMD.RS */
++ if(bits(sc.op,4,1,0,100000)) {
++  printf("usbmsc: recovery: controller did not start\n");
++ }
++
++ /* 3. point every endpoint back at the start of its rebuilt ring. This has
++  * to come after RUN: xHCI only accepts Set TR Dequeue Pointer while the
++  * controller is running. */
+  usbmsc_set_dequeue(1,EP0);
+  if(sc.in){usbmsc_set_dequeue(sc.in,BIN);}
+  if(sc.out){usbmsc_set_dequeue(sc.out,BOUT);}
+  sc.ei=0;sc.ec=1;
+- wr64(sc.rt,0x28,phys(EVT));
+- /* device context slot survived; re-arm the ring enable bits */
+- /* 2. clear halt on both bulk pipes, then the class reset */
++ wr64(sc.rt,0x18,phys(EVT));            /* ERDP: restart the event segment */
++
++ /* 4. clear halt on both bulk pipes, then the class reset */
+  udelay(20000);
+  (void)control(0x02,1,0,sc.in,0);
+  (void)control(0x02,1,0,sc.out,0);
+  udelay(20000);
+  int err=control(0x21,0xff,0,sc.iface,0);
+  if(err){printf("usbmsc: BOT class reset err=%d (continuing)\n",err);}
++
+  /* Whatever happened above, allow traffic again. */
+  sc.failed=false;
+  printf("usbmsc: BOT state recovered\n");
