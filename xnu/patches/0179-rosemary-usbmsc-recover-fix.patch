@@ -1,0 +1,64 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -541,18 +541,24 @@
+  * transport error into "Too many corpses being created" across userspace.
+  */
+ static int usbmsc_recover(void) {
+- int err;
+  printf("usbmsc: recovering BOT state\n");
+- /* 1. class reset */
+- err=control(0x21,0xff,0,sc.iface,0);
+- if(err){printf("usbmsc: BOT reset failed err=%d\n",err);return err;}
+- /* 2. clear halt on both bulk pipes */
+- udelay(20000);
+- (void)control(0x02,1,0,sc.in,0);
+- (void)control(0x02,1,0,sc.out,0);
+- udelay(20000);
+- /* 3. fresh rings */
++ /*
++  * Order matters. control() itself drives the EP0 ring, so the rings have to
++  * be rebuilt before any control transfer is attempted; doing it the other way
++  * round ran the reset through a stale ring and the failure left sc.failed
++  * set, which is how the previous attempt ended up locking the driver out of
++  * every later request.
++  *
++  * Every step below is best effort: whatever the device answers, the driver
++  * clears sc.failed at the end and tries again. A disk that is really gone
++  * will fail on the next transfer anyway.
++  */
++ /* 1. fresh rings */
+  bzero((void *)sc.pool,POOL_SIZE);
++ /* The zeroing above also wipes DCBAA, which has to point at this device's
++  * output context slot again before the controller walks it. */
++ ((uint64_t *)mem(DCBAA))[sc.slot]=phys(OUTPUT);
++ clean(DCBAA,4096);
+  init_ring(&sc.cmd,CMD);init_ring(&sc.ep0,EP0);
+  init_ring(&sc.bin,BIN);init_ring(&sc.bout,BOUT);
+  sc.ei=0;sc.ec=1;sc.tag=0;
+@@ -563,6 +569,14 @@
+  wr(sc.rt,0x10,2);wr(sc.rt,0x14,0);wr(sc.rt,0x18,1);
+  wr64(sc.rt,0x20,phys(ERST));wr64(sc.rt,0x28,phys(EVT));
+  /* device context slot survived; re-arm the ring enable bits */
++ /* 2. clear halt on both bulk pipes, then the class reset */
++ udelay(20000);
++ (void)control(0x02,1,0,sc.in,0);
++ (void)control(0x02,1,0,sc.out,0);
++ udelay(20000);
++ int err=control(0x21,0xff,0,sc.iface,0);
++ if(err){printf("usbmsc: BOT class reset err=%d (continuing)\n",err);}
++ /* Whatever happened above, allow traffic again. */
+  sc.failed=false;
+  printf("usbmsc: BOT state recovered\n");
+  return 0;
+@@ -751,7 +765,10 @@
+  buf_setresid(bp,buf_count(bp));
+  lck_mtx_lock(&usbmsc_lock);
+  if(!sc.ready){err=ENXIO;goto out;}
+- if(sc.failed){err=ENXIO;goto out;}
++ /* A previous transfer failed: try the reset sequence once here rather than
++  * refusing every later request, which is what turned one hiccup into a dead
++  * root device and a launchd "too many corpses" storm. */
++ if(sc.failed){(void)usbmsc_recover();}
+  /* buf_blkno follows the logical block size negotiated by HFS. */
+  uint64_t factor=sc.blocksize/512;
+  if(block<0||(bytes&511)||((uint64_t)block>(sc.sectors-sc.base_lba)/factor)){err=EINVAL;goto out;}
