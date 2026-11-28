@@ -1,0 +1,75 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -528,8 +528,48 @@
+  *actual=size-remaining;
+  return 0;
+ }
+-/* Single command at a time. On malformed/failed transport, fail closed:
+- * do not reuse an uncertain ring or issue a second CBW.
++/*
++ * Bulk-Only Transport reset recovery, the sequence the spec (and every host
++ * driver) prescribes after a stalled or timed-out transfer:
++ *
++ *   1. BOT Mass Storage Reset      class request 0xFF, wIndex = interface
++ *   2. CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints
++ *   3. restart the rings and re-arm the doorbells
++ *
++ * Without this a single hiccup set sc.failed and the driver refused every
++ * later request with ENXIO for the rest of the boot, which is what turned one
++ * transport error into "Too many corpses being created" across userspace.
++ */
++static int usbmsc_recover(void) {
++ int err;
++ printf("usbmsc: recovering BOT state\n");
++ /* 1. class reset */
++ err=control(0x21,0xff,0,sc.iface,0);
++ if(err){printf("usbmsc: BOT reset failed err=%d\n",err);return err;}
++ /* 2. clear halt on both bulk pipes */
++ udelay(20000);
++ (void)control(0x02,1,0,sc.in,0);
++ (void)control(0x02,1,0,sc.out,0);
++ udelay(20000);
++ /* 3. fresh rings */
++ bzero((void *)sc.pool,POOL_SIZE);
++ init_ring(&sc.cmd,CMD);init_ring(&sc.ep0,EP0);
++ init_ring(&sc.bin,BIN);init_ring(&sc.bout,BOUT);
++ sc.ei=0;sc.ec=1;sc.tag=0;
++ uint32_t *erst=(uint32_t *)mem(ERST);
++ erst[0]=(uint32_t)phys(EVT);erst[1]=(uint32_t)(phys(EVT)>>32);erst[2]=NT;
++ sync_dma(0,POOL_SIZE);
++ wr64(sc.op,0x18,phys(CMD)|1);wr64(sc.op,0x30,phys(DCBAA));
++ wr(sc.rt,0x10,2);wr(sc.rt,0x14,0);wr(sc.rt,0x18,1);
++ wr64(sc.rt,0x20,phys(ERST));wr64(sc.rt,0x28,phys(EVT));
++ /* device context slot survived; re-arm the ring enable bits */
++ sc.failed=false;
++ printf("usbmsc: BOT state recovered\n");
++ return 0;
++}
++
++/* Single command at a time. A failed transfer triggers one recovery attempt
++ * instead of disabling the device for good.
+  *
+  * in=true is a device-to-host transfer (READ), in=false is host-to-device
+  * (WRITE). BOT puts the direction in bmCBWFlags bit 7 and the same byte count
+@@ -552,7 +592,10 @@
+  if(le32(csw+8))goto transport_fail;
+  return 0;
+ transport_fail:
+- sc.failed=true;printf("usbmsc: BOT transport stopped tag=%u err=%d bytes=%u\n",tag,err,done);
++ sc.failed=true;
++ printf("usbmsc: BOT transport stopped tag=%u err=%d bytes=%u done=%u csw=%08x\n",
++     tag,err,length,done,le32(csw));
++ (void)usbmsc_recover();
+  return err?err:EIO;
+ }
+ static int scsi(const uint8_t *cdb,uint32_t cdblen,uint32_t length,bool in) {
+@@ -707,7 +750,8 @@
+  caddr_t mapped=NULL;
+  buf_setresid(bp,buf_count(bp));
+  lck_mtx_lock(&usbmsc_lock);
+- if(!sc.ready||sc.failed){err=ENXIO;goto out;}
++ if(!sc.ready){err=ENXIO;goto out;}
++ if(sc.failed){err=ENXIO;goto out;}
+  /* buf_blkno follows the logical block size negotiated by HFS. */
+  uint64_t factor=sc.blocksize/512;
+  if(block<0||(bytes&511)||((uint64_t)block>(sc.sectors-sc.base_lba)/factor)){err=EINVAL;goto out;}
