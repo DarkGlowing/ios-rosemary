@@ -1,0 +1,113 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -540,6 +540,19 @@
+  * later request with ENXIO for the rest of the boot, which is what turned one
+  * transport error into "Too many corpses being created" across userspace.
+  */
++/*
++ * xHCI keeps its own dequeue position per endpoint. Rebuilding a ring in
++ * memory is not enough: until the controller is told where the ring starts
++ * again (Set TR Dequeue Pointer, TRB type 16) it keeps walking the old
++ * position, which is why the previous recovery left every later transfer
++ * timing out. Parameter is the ring address with the DCS bit set; the status
++ * word carries the endpoint ID.
++ */
++static void usbmsc_set_dequeue(uint32_t dci,uint32_t ring_off) {
++ uint64_t p=phys(ring_off)|1u;
++ command(16,p,dci<<16,NULL);
++}
++
+ static int usbmsc_recover(void) {
+  printf("usbmsc: recovering BOT state\n");
+  /*
+@@ -568,6 +581,13 @@
+  wr64(sc.op,0x18,phys(CMD)|1);wr64(sc.op,0x30,phys(DCBAA));
+  wr(sc.rt,0x10,2);wr(sc.rt,0x14,0);wr(sc.rt,0x18,1);
+  wr64(sc.rt,0x20,phys(ERST));wr64(sc.rt,0x28,phys(EVT));
++ /* Point every endpoint back at the start of its rebuilt ring. EP0 first:
++  * the control transfers below are what needs it. */
++ usbmsc_set_dequeue(1,EP0);
++ if(sc.in){usbmsc_set_dequeue(sc.in,BIN);}
++ if(sc.out){usbmsc_set_dequeue(sc.out,BOUT);}
++ sc.ei=0;sc.ec=1;
++ wr64(sc.rt,0x28,phys(EVT));
+  /* device context slot survived; re-arm the ring enable bits */
+  /* 2. clear halt on both bulk pipes, then the class reset */
+  udelay(20000);
+@@ -612,7 +632,40 @@
+  (void)usbmsc_recover();
+  return err?err:EIO;
+ }
++/*
++ * Some sticks answer ILLEGAL REQUEST (sense key 5, ASC 0x20) to commands they
++ * simply do not implement -- SYNCHRONIZE CACHE (0x35) is the common one on
++ * cheap USB bridges. That is a property of the device, not a transport fault:
++ * retrying it, or running the BOT recovery sequence because of it, only makes
++ * things worse. Remember which opcodes were refused and answer EOPNOTSUPP
++ * without touching the transport from then on.
++ */
++#define USBMSC_UNSUPPORTED_MAX 8
++static uint8_t usbmsc_unsupported[USBMSC_UNSUPPORTED_MAX];
++
++static bool usbmsc_opcode_refused(uint8_t op) {
++ for (unsigned i = 0; i < USBMSC_UNSUPPORTED_MAX; i++) {
++  if (usbmsc_unsupported[i] == op) {
++   return true;
++  }
++ }
++ return false;
++}
++
++static void usbmsc_opcode_mark(uint8_t op) {
++ for (unsigned i = 0; i < USBMSC_UNSUPPORTED_MAX; i++) {
++  if (usbmsc_unsupported[i] == 0) {
++   usbmsc_unsupported[i] = op;
++   printf("usbmsc: opcode 0x%02x not supported by the device, will not retry\n", op);
++   return;
++  }
++ }
++}
++
+ static int scsi(const uint8_t *cdb,uint32_t cdblen,uint32_t length,bool in) {
++ if (cdblen && usbmsc_opcode_refused(cdb[0])) {
++  return ENOTSUP;
++ }
+  for(unsigned attempt=0;attempt<3;attempt++) {
+   int err=bot(cdb,cdblen,length,in);
+   if(!err||sc.failed)return err;
+@@ -622,7 +675,19 @@
+   uint8_t *s=mem(DATA);uint32_t response=s[0]&127;
+   if(response!=0x70&&response!=0x71)return EIO;
+   uint32_t key=s[2]&15,asc=s[12],ascq=s[13];
+-  printf("usbmsc: sense key=%u asc=%02x ascq=%02x\n",key,asc,ascq);
++  printf("usbmsc: sense key=%u asc=%02x ascq=%02x op=0x%02x\n",
++      key,asc,ascq,cdblen?cdb[0]:0);
++  /*
++   * key 5 (ILLEGAL REQUEST) with ASC 0x20 (invalid command operation code)
++   * means the device does not implement this opcode at all: record it and
++   * stop sending it, instead of failing every caller that asks.
++   */
++  if (key == 5 && asc == 0x20) {
++   if (cdblen) {
++    usbmsc_opcode_mark(cdb[0]);
++   }
++   return ENOTSUP;
++  }
+   if(key!=6 && !(key==2&&asc==4&&ascq==1))return EIO;
+   udelay(200000);
+  }
+@@ -644,9 +709,13 @@
+ }
+ /* SYNCHRONIZE CACHE(10): the stick has its own write cache, and an HFS+ root
+  * that never flushed would lose the directory it had just updated. */
++/* Optional on this class of device: if the bridge does not implement
++ * SYNCHRONIZE CACHE the data is already on the medium (these sticks have no
++ * write cache of their own), so ENOTSUP is success for our purposes. */
+ static int sync_cache(void) {
+  uint8_t c[10]={0x35,0,0,0,0,0,0,0,0,0};
+- return scsi(c,10,0,false);
++ int err=scsi(c,10,0,false);
++ return err==ENOTSUP?0:err;
+ }
+ /* Validate an HFS+ volume header at base+2 and remember where the volume
+  * starts: a stick written with an iOS root image has it at absolute LBA 2,
