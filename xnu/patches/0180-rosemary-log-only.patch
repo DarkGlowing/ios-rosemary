@@ -1,11 +1,10 @@
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -583,7 +583,118 @@
+@@ -583,6 +583,121 @@
  	.d_type       = D_DISK,
  };
  
--static int
-+static /*
++/*
 + * ROSEMARY: arm the persistent console log without taking root on UFS.
 + *
 + * The kernel mirrors every console line (printf and kprintf both reach
@@ -90,11 +89,15 @@
 +	return 0;
 +}
 +
++/* osfmk/kern/thread.c; not visible through the headers this file includes,
++ * same declaration rosemary_mali.c uses. */
++extern kern_return_t thread_terminate(thread_t);
++
 +static void
 +sweet_ufs_log_thread(__unused void *arg, __unused wait_result_t wr)
 +{
 +	(void)sweet_ufs_log_only();
-+	thread_terminate(current_thread());
++	(void)thread_terminate(current_thread());
 +}
 +
 +/*
@@ -116,10 +119,9 @@
 +	}
 +}
 +
-+int
+ static int
  sweet_ufs_init(void)
  {
- 	DTEntry node;
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
 @@ -815,6 +815,17 @@
