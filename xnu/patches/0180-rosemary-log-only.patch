@@ -1,0 +1,142 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -583,7 +583,118 @@
+ 	.d_type       = D_DISK,
+ };
+ 
+-static int
++static /*
++ * ROSEMARY: arm the persistent console log without taking root on UFS.
++ *
++ * The kernel mirrors every console line (printf and kprintf both reach
++ * _cnputs) into a 4 MiB ring, and sweet_log_thread() copies that ring to the
++ * last blocks of a partition every few seconds. That thread was only ever
++ * started from sweet_ufs_init(), i.e. when the root came from UFS; booting
++ * with rd=usbroot0 therefore left the ring in DRAM and the only record of a
++ * boot was whatever fitted on the screen.
++ *
++ * This brings up just enough of the UFS host to run the flusher: map the
++ * controller, allocate the DMA bounce buffer, take the host over, read the
++ * GPT and find "userdata". No bdevsw, no devfs nodes, no root.
++ *
++ * Called on its own thread from IOFindBSDRoot: it blocks on the device.
++ */
++int
++sweet_ufs_log_only(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	int error;
++
++	if (su.ready) {
++		return 0;
++	}
++	if (SecureDTLookupEntry(NULL, "/rosemary-ufs", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("ROSEMARY LOG: no /rosemary-ufs node\n");
++		return ENXIO;
++	}
++	su.regs = ml_io_map(reg[0], reg[1]);
++	if (su.regs == 0) {
++		printf("ROSEMARY LOG: cannot map UFS registers\n");
++		return ENXIO;
++	}
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("ROSEMARY LOG: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	su.dma_pa = ptoa_64(pn);
++	/*
++	 * MT6785 exposes three UFS LUNs. LUN 0/1 are the small boot LUNs with no
++	 * partition table; the Android GPT -- and userdata -- are on LUN 2.
++	 */
++	uint32_t lun = 2;
++	(void)PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
++	su.lun = (uint8_t)(lun > 7 ? 2 : lun);
++	su.secsize = DEV_BSIZE;
++	/* The host is not cache coherent: without these the CPU reads back the
++	 * zeros it wrote at allocation instead of what the device transferred. */
++	su.cache = true;
++	su.wait = true;
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_take_over_host();
++	if (!error) {
++		static const uint8_t tur[6] = { 0x00 };
++		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		}
++	}
++	if (!error) {
++		error = ufs_find_partition("userdata");
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		printf("ROSEMARY LOG: UFS bring-up failed (%d)\n", error);
++		return error;
++	}
++
++	su.writable = true;
++	su.ready = true;
++	printf("ROSEMARY LOG: console log armed, userdata first block 0x%llx, %llu MiB\n",
++	    su.first_block, su.nblocks * UFS_BLOCK >> 20);
++	sweet_log_start();
++	return 0;
++}
++
++static void
++sweet_ufs_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	(void)sweet_ufs_log_only();
++	thread_terminate(current_thread());
++}
++
++/*
++ * Spawn the log-only bring-up on its own thread: it talks to the device and
++ * must not delay the root mount in IOFindBSDRoot.
++ */
++void
++sweet_ufs_log_arm(void)
++{
++	thread_t thread;
++	uint32_t on = 1;
++
++	(void)PE_parse_boot_argn("sweetlogufs", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	if (kernel_thread_start(sweet_ufs_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++int
+ sweet_ufs_init(void)
+ {
+ 	DTEntry node;
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -815,6 +815,17 @@
+ 		extern int rosemary_usbmsc_rootdev(dev_t *dev);
+ 		extern int rosemary_usbmsc_stage;
+ 		extern char rosemary_usbmsc_diag[];
++#if defined(ROSEMARY)
++		/*
++		 * Start the persistent console log on its own thread. The root is
++		 * the stick, so sweet_ufs_init() never runs and the 4 MiB console
++		 * ring would otherwise stay in DRAM: with userspace running there
++		 * is far more output than a screen can hold, and a pulled log is
++		 * the only way to read a boot back.
++		 */
++		extern void sweet_ufs_log_arm(void);
++		sweet_ufs_log_arm();
++#endif
+ 		OSSafeReleaseNULL(matching);
+ 		int usb_error = rosemary_usbmsc_rootdev(root);
+ 		if (usb_error) {
