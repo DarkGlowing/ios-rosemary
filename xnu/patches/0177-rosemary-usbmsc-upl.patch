@@ -1,0 +1,66 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -702,29 +702,34 @@
+ static void usbmsc_strategy(struct buf *bp) {
+  uint64_t bytes=buf_count(bp);daddr64_t block=buf_blkno(bp);int err=0;
+ #if defined(ROSEMARY)
+- /* The exec of /sbin/launchd fails with EINVAL and none of the kernel-side
+-  * checks is responsible, so the file read path is the remaining suspect.
+-  * Log the shape of every request that fails, which says whether the vnode
+-  * layer is asking for something this driver refuses.
+-  */
+  uint64_t d_bytes=bytes; daddr64_t d_block=block; uint32_t d_flags=buf_flags(bp);
+ #endif
++ caddr_t mapped=NULL;
+  buf_setresid(bp,buf_count(bp));
+  lck_mtx_lock(&usbmsc_lock);
+  if(!sc.ready||sc.failed){err=ENXIO;goto out;}
+  /* buf_blkno follows the logical block size negotiated by HFS. */
+  uint64_t factor=sc.blocksize/512;
+-#if defined(ROSEMARY)
+- int dbg=0;
+- if(block<0){dbg=1;err=EINVAL;goto out;}
+- if(bytes&511){dbg=2;err=EINVAL;goto out;}
+- if((uint64_t)block>(sc.sectors-sc.base_lba)/factor){dbg=3;err=EINVAL;goto out;}
+-#endif
+  if(block<0||(bytes&511)||((uint64_t)block>(sc.sectors-sc.base_lba)/factor)){err=EINVAL;goto out;}
+  uint64_t lba=(uint64_t)block*factor+sc.base_lba;
+  if(bytes/512>sc.sectors-lba){err=EINVAL;goto out;}
++ /*
++  * Files are read with cluster_read(), i.e. B_CLUSTER buffers, which carry a
++  * UPL instead of a data pointer: buf_dataptr() returns 0 for those and the
++  * mapping has to be asked for separately. The mount only ever read metadata
++  * through buf_meta_bread(), which has a plain data pointer, so this never
++  * showed up until exec read the first file -- and the original check turned
++  * that into EINVAL, which exec reported as 'errno 22'.
++  *
++  * buf_map() on a B_CLUSTER buffer returns the address of the underlying
++  * "real" buffer and needs no unmapping (buf_brelse() handles it); on a
++  * buf_alloc() buffer it creates a mapping, which buf_unmap() releases.
++  */
+  uint8_t *data=(uint8_t *)(uintptr_t)buf_dataptr(bp);
+- if(!data&&bytes){err=EINVAL;goto out;}
++ if(!data&&bytes) {
++  if(buf_map(bp,&mapped)!=0||!mapped){err=ENOMEM;goto out;}
++  data=(uint8_t *)mapped;
++ }
+  bool const writep=(buf_flags(bp)&B_READ)==0;
+  if(writep&&!usbmsc_rw){err=EROFS;goto out;}
+  while(bytes) {
+@@ -740,15 +745,12 @@
+   data+=n;lba+=n/512;bytes-=n;buf_setresid(bp,(int)bytes);
+  }
+ out:
++ if(mapped)buf_unmap(bp);
+ #if defined(ROSEMARY)
+  if(err) {
+   printf("ROSEMARY USBMSC: error=%d blk=%lld bytes=%llu flags=0x%x writep=%d\n",
+       err,(long long)d_block,(unsigned long long)d_bytes,d_flags,
+       (d_flags&B_READ)==0);
+-  printf("ROSEMARY USBMSC: state sectors=%llu base=%llu blocksize=%u factor=%llu lba=%llu\n",
+-      (unsigned long long)sc.sectors,(unsigned long long)sc.base_lba,
+-      sc.blocksize,(unsigned long long)(sc.blocksize/512),
+-      (unsigned long long)((uint64_t)d_block*(sc.blocksize/512)+sc.base_lba));
+  }
+ #endif
+  lck_mtx_unlock(&usbmsc_lock);if(err)buf_seterror(bp,err);buf_biodone(bp);
