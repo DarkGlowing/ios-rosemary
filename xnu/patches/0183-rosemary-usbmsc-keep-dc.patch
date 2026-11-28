@@ -1,0 +1,23 @@
+--- a/bsd/dev/rosemary_usbmsc.c
++++ b/bsd/dev/rosemary_usbmsc.c
+@@ -577,10 +577,16 @@
+   printf("usbmsc: recovery: controller did not halt\n");
+  }
+ 
+- /* 1. fresh rings and a valid DCBAA entry (the zeroing wipes it) */
+- bzero((void *)sc.pool,POOL_SIZE);
+- ((uint64_t *)mem(DCBAA))[sc.slot]=phys(OUTPUT);
+- clean(DCBAA,4096);
++ /*
++  * 1. fresh command and transfer rings only.
++  *
++  * Not a whole-pool bzero: that also wiped OUTPUT (0x5000), the device
++  * context that holds this slot's endpoint contexts. With those zeroed the
++  * endpoints sit in Disabled state, and the Set TR Dequeue Pointer commands
++  * below then answer TRB Error (completion code 5) -- which is exactly what
++  * the log shows: three "completion type=33 dci=0 cc=5" in a row. DCBAA and
++  * the device context are left alone; they stay valid from bring-up.
++  */
+  init_ring(&sc.cmd,CMD);init_ring(&sc.ep0,EP0);
+  init_ring(&sc.bin,BIN);init_ring(&sc.bout,BOUT);
+  sc.ei=0;sc.ec=1;sc.tag=0;
